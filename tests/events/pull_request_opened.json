@@ -1,0 +1,5 @@
+{
+  "action": "opened",
+  "pull_request": {"number": 7, "draft": false, "head": {"sha": "abc123"}},
+  "repository": {"full_name": "me/reviewbot-playground"}
+}

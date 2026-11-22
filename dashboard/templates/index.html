@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReviewBot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;800&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#070a14; --glass:rgba(255,255,255,.06); --line:rgba(255,255,255,.12);
+          --text:#e8ecf8; --muted:#8b94b3; --a:#7c5cff; --b:#22d3ee; --hi:#ff4d6d; --md:#ffb02e; --lo:#7d8aa8; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 Inter,system-ui,sans-serif; background:var(--bg); color:var(--text); overflow-x:hidden; }
+  #bg { position:fixed; inset:0; z-index:-1; }
+  main { max-width:1200px; margin:0 auto; padding:48px 24px 80px; }
+  header { margin-bottom:36px; }
+  .pill { display:inline-flex; gap:8px; align-items:center; padding:6px 14px; border:1px solid var(--line);
+          border-radius:99px; background:var(--glass); backdrop-filter:blur(10px); color:var(--muted); font-size:13px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#34d399; box-shadow:0 0 10px #34d399; }
+  h1 { font-size:clamp(40px,7vw,76px); line-height:1; margin:18px 0 10px; font-weight:800; letter-spacing:-.03em;
+       background:linear-gradient(120deg,#fff 10%,var(--b) 45%,var(--a) 90%); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  header p { color:var(--muted); margin:0; max-width:560px; font-size:17px; }
+  .glass { background:var(--glass); border:1px solid var(--line); border-radius:20px; backdrop-filter:blur(16px);
+           box-shadow:0 20px 50px -20px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.08); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin-bottom:16px; perspective:900px; }
+  .card { padding:22px; transform-style:preserve-3d; will-change:transform; position:relative; overflow:hidden; }
+  .card::after { content:""; position:absolute; inset:0; background:radial-gradient(240px circle at var(--mx,50%) var(--my,0%),rgba(124,92,255,.25),transparent 70%); pointer-events:none; }
+  .card small { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.08em; }
+  .card b { display:block; font-size:38px; font-weight:800; margin-top:6px; transform:translateZ(30px); }
+  .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:16px; margin-bottom:16px; }
+  .panel { padding:22px; }
+  .panel h2 { margin:0 0 14px; font-size:15px; font-weight:600; color:var(--muted); }
+  .tablewrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; }
+  th { color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.07em; }
+  th,td { text-align:left; padding:12px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  tbody tr { transition:background .2s; } tbody tr:hover { background:rgba(124,92,255,.12); }
+  tbody tr:last-child td { border:0; }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .tag { display:inline-block; min-width:28px; text-align:center; padding:2px 8px; border-radius:99px; font-weight:600; font-size:13px; }
+  .t-hi { background:rgba(255,77,109,.18); color:var(--hi); } .t-md { background:rgba(255,176,46,.18); color:var(--md); } .t-lo { background:rgba(125,138,168,.18); color:var(--lo); }
+  .zero { opacity:.35; }
+  input,select,button { font:inherit; color:var(--text); background:rgba(255,255,255,.07); border:1px solid var(--line); border-radius:10px; padding:8px 12px; }
+  select option { color:#000; }
+  button { cursor:pointer; transition:background .2s; } button:hover { background:rgba(124,92,255,.35); }
+  button.go { background:linear-gradient(120deg,var(--a),var(--b)); border:0; font-weight:600; }
+  button.danger:hover { background:rgba(255,77,109,.35); }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
+  .row .grow { flex:1; min-width:220px; } input[type=number] { width:90px; }
+  .msg { color:var(--hi); font-size:13px; min-height:18px; }
+  .repo { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px 0; border-top:1px solid var(--line); }
+  .repo b { flex:1; min-width:200px; }
+  tbody tr { cursor:pointer; }
+  #modal { position:fixed; inset:0; background:rgba(3,5,12,.7); backdrop-filter:blur(6px); display:none; align-items:center; justify-content:center; padding:20px; z-index:10; }
+  #modal .box { max-width:760px; width:100%; max-height:85vh; overflow:auto; padding:26px; background:#0d1222; }
+  #modal h3 { margin:0 0 4px; } #modal a { color:var(--b); }
+  .issue { padding:14px 0; border-top:1px solid var(--line); }
+  .issue .meta { color:var(--muted); font-size:13px; margin-bottom:6px; }
+  .issue p { margin:0 0 8px; }
+  .thumb.on { background:rgba(52,211,153,.35); } .thumb.down.on { background:rgba(255,77,109,.35); }
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<main>
+  <header>
+    <span class="pill"><span class="dot"></span> Live · AI code reviews</span>
+    <h1>ReviewBot</h1>
+    <p>Claude reviews every pull request. Here is what it found, what it cost, and how fast it was.</p>
+  </header>
+  <div class="cards" id="cards"></div>
+  <div class="charts">
+    <div class="glass panel"><h2>Issues by severity</h2><canvas id="sev"></canvas></div>
+    <div class="glass panel"><h2>Cost per review (USD)</h2><canvas id="cost"></canvas></div>
+  </div>
+  <div class="glass panel" style="margin-bottom:16px">
+    <h2>GitHub accounts</h2>
+    <div class="row">
+      <input id="token" type="password" class="grow" autocomplete="off" placeholder="Paste a GitHub personal access token (github_pat_...)">
+      <button id="addacct" class="go">Add account</button>
+    </div>
+    <div class="msg" id="amsg"></div>
+    <div id="accts"></div>
+  </div>
+  <div class="glass panel" style="margin-bottom:16px">
+    <h2>Repositories</h2>
+    <div class="row">
+      <select id="account"></select>
+      <input id="repo" class="grow" placeholder="owner/name or https://github.com/owner/name">
+      <select id="model"><option value="claude-haiku-5-5">Haiku (cheaper)</option><option value="claude-sonnet-5-5">Sonnet (smarter)</option></select>
+      <label>max $ / review <input id="cap" type="number" min="0.01" max="10" step="0.05" value="0.50"></label>
+      <button id="connect" class="go">Connect</button>
+    </div>
+    <div class="msg" id="msg"></div>
+    <div id="repos"></div>
+  </div>
+  <div class="glass panel">
+    <h2>Recent reviews</h2>
+    <div class="row">
+      <input id="q" class="grow" placeholder="Search title, repo, PR number or issue text">
+      <select id="frepo"><option value="">All repos</option></select>
+      <select id="fmodel"><option value="">All models</option><option>claude-haiku-5-5</option><option>claude-sonnet-5-5</option></select>
+      <select id="fsev"><option value="">Any severity</option><option value="high">Has high</option><option value="medium">Has medium</option><option value="low">Has low</option></select>
+    </div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Time (UTC)</th><th>Repo</th><th>PR</th><th>Title</th><th>Model</th>
+        <th class="num">High</th><th class="num">Med</th><th class="num">Low</th>
+        <th class="num">Cost $</th><th class="num">Secs</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+  </div>
+</main>
+<div id="modal"><div class="glass box" id="box"></div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

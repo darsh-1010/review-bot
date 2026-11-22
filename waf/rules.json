@@ -1,0 +1,11 @@
+[
+  {"Name": "rate-limit-per-ip", "Priority": 0, "Action": {"Block": {}},
+   "Statement": {"RateBasedStatement": {"Limit": 300, "AggregateKeyType": "IP"}},
+   "VisibilityConfig": {"SampledRequestsEnabled": true, "CloudWatchMetricsEnabled": true, "MetricName": "rate-limit"}},
+  {"Name": "aws-common", "Priority": 1, "OverrideAction": {"None": {}},
+   "Statement": {"ManagedRuleGroupStatement": {"VendorName": "AWS", "Name": "AWSManagedRulesCommonRuleSet"}},
+   "VisibilityConfig": {"SampledRequestsEnabled": true, "CloudWatchMetricsEnabled": true, "MetricName": "aws-common"}},
+  {"Name": "aws-known-bad-inputs", "Priority": 2, "OverrideAction": {"None": {}},
+   "Statement": {"ManagedRuleGroupStatement": {"VendorName": "AWS", "Name": "AWSManagedRulesKnownBadInputsRuleSet"}},
+   "VisibilityConfig": {"SampledRequestsEnabled": true, "CloudWatchMetricsEnabled": true, "MetricName": "aws-bad-inputs"}}
+]

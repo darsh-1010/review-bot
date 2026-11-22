@@ -1,0 +1,463 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: ReviewBot - AI pull request reviewer
+
+Parameters:
+  ClaudeModel:
+    Type: String
+    Default: claude-haiku-5-5
+    AllowedValues: [claude-haiku-5-5, claude-sonnet-5-5]
+  CloudFrontPrefixList:
+    Type: String            # aws ec2 describe-managed-prefix-lists (Phase 6, Step 1)
+  OriginSecret:
+    Type: String
+    NoEcho: true
+  DashboardOrigin:
+    Type: String
+    Default: ''             # empty on the first deploy; the server's public DNS after that
+  AlertEmail:
+    Type: String
+    Default: ''             # optional: subscribes this address to alarms and the weekly report
+  AlertEmail2:
+    Type: String
+    Default: ''             # optional second address
+  WebAclArn:
+    Type: String
+    Default: ''             # optional: output of scripts/create-waf.sh (the web ACL is made in us-east-1 by the CLI)
+
+Conditions:
+  FirstDeploy: !Equals [!Ref DashboardOrigin, '']
+  HasEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasEmail2: !Not [!Equals [!Ref AlertEmail2, '']]
+  HasWaf: !Not [!Equals [!Ref WebAclArn, '']]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ReviewsTable
+
+Resources:
+  # ---------- Webhook pipeline ----------
+  WebhookApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 2
+        ThrottlingBurstLimit: 5
+
+  # One table, several item kinds (pk prefix): REVIEW, REPOS/<repo> (connected repo + settings), FB#<repo> (feedback), DELIVERY#<id>
+  ReviewsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }
+
+  JobDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 1080
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobDLQ.Arn
+        maxReceiveCount: 3
+
+  ReceiverLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /reviewbot/receiver, RetentionInDays: 7 }
+
+  ReviewerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /reviewbot/reviewer, RetentionInDays: 7 }
+
+  ReportLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /reviewbot/report, RetentionInDays: 7 }
+
+  # SAM builds each function's IAM role from the Policies below (least privilege, no LabRole).
+  ReceiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/receiver/
+      Handler: app.handler
+      MemorySize: 128
+      Timeout: 10
+      LoggingConfig:
+        LogGroup: !Ref ReceiverLogs
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ReviewsTable }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt JobQueue.QueueName }
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/webhook-secret
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref JobQueue
+          WEBHOOK_SECRET_PARAM: /reviewbot/webhook-secret
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookApi
+            Path: /webhook
+            Method: POST
+
+  ReviewerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/reviewer/
+      Handler: app.handler
+      MemorySize: 256
+      Timeout: 180
+      LoggingConfig:
+        LogGroup: !Ref ReviewerLogs
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ReviewsTable }
+        - S3WritePolicy: { BucketName: !Ref AnalyticsBucket }
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/anthropic-api-key
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/github-token
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/slack-webhook
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/gh/*     # per-account GitHub tokens
+      Environment:
+        Variables:
+          CLAUDE_MODEL: !Ref ClaudeModel
+          CLAUDE_KEY_PARAM: /reviewbot/anthropic-api-key
+          GITHUB_TOKEN_PARAM: /reviewbot/github-token
+          SLACK_PARAM: /reviewbot/slack-webhook       # optional: Slack alert on high-severity issues
+          ANALYTICS_BUCKET: !Ref AnalyticsBucket
+      Events:
+        Jobs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt JobQueue.Arn
+            BatchSize: 1
+            ScalingConfig:
+              MaximumConcurrency: 2
+
+  # ---------- Weekly report (EventBridge schedule -> Lambda -> SNS email) ----------
+  ReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/report/
+      Handler: app.handler
+      MemorySize: 128
+      Timeout: 30
+      LoggingConfig:
+        LogGroup: !Ref ReportLogs
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ReviewsTable }
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt AlertTopic.TopicName }
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref AlertTopic
+      Events:
+        Weekly:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 13 ? * MON *)   # Mondays 13:00 UTC
+
+  # ---------- Dashboard ----------
+  DashboardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: 'sts:AssumeRole' }
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]   # lets SSM Run Command deploy to it
+      Policies:
+        - PolicyName: dashboard
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+                Resource: !GetAtt ReviewsTable.Arn
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/webhook-secret
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/github-token
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/dashboard-password
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/origin-secret
+              - Effect: Allow                  # the dashboard stores and removes GitHub account tokens
+                Action: [ssm:GetParameter, ssm:PutParameter, ssm:DeleteParameter]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/gh/*
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${ReleaseBucket.Arn}/*
+
+  DashboardProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref DashboardRole]
+
+  DashboardSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ReviewBot dashboard - HTTP from CloudFront only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixList
+
+  DashboardInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref DashboardProfile
+      SecurityGroupIds: [!GetAtt DashboardSG.GroupId]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 8, VolumeType: gp3, Encrypted: true }
+      Tags: [{ Key: Name, Value: reviewbot-dashboard }]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -eux
+          dnf -y upgrade --security
+          dnf -y install nginx python3.12 python3.12-pip unzip
+          fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+          echo '/swapfile none swap sw 0 0' >> /etc/fstab
+          useradd --system --create-home --home-dir /opt/reviewbot reviewbot
+          systemctl enable --now nginx
+
+  ReleaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules: [{ Id: expire-old, Status: Enabled, ExpirationInDays: 30 }]
+
+  DashboardCDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: ReviewBot dashboard
+        PriceClass: PriceClass_200
+        WebACLId: !If [HasWaf, !Ref WebAclArn, !Ref 'AWS::NoValue']
+        Origins:
+          - Id: ec2
+            DomainName: !If [FirstDeploy, !GetAtt DashboardInstance.PublicDnsName, !Ref DashboardOrigin]
+            CustomOriginConfig: { OriginProtocolPolicy: http-only, HTTPPort: 80 }
+            OriginCustomHeaders:
+              - { HeaderName: X-Origin-Verify, HeaderValue: !Ref OriginSecret }
+        DefaultCacheBehavior:
+          TargetOriginId: ec2
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]   # the dashboard now has forms
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+
+  # ---------- Analytics: reviewer writes one JSON file per review to S3, Athena queries it ----------
+  AnalyticsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules: [{ Id: expire-query-results, Status: Enabled, Prefix: athena-results/, ExpirationInDays: 7 }]
+
+  AnalyticsDb:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput: { Name: reviewbot }
+
+  AnalyticsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AnalyticsDb
+      TableInput:
+        Name: reviews
+        TableType: EXTERNAL_TABLE
+        Parameters:               # partition projection: new days show up with no MSCK REPAIR
+          classification: json
+          projection.enabled: 'true'
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: 2026-01-01,NOW
+          storage.location.template: !Sub s3://${AnalyticsBucket}/reviews/dt=${!dt}/
+        PartitionKeys: [{ Name: dt, Type: string }]
+        StorageDescriptor:
+          Location: !Sub s3://${AnalyticsBucket}/reviews/
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo: { SerializationLibrary: org.openx.data.jsonserde.JsonSerDe }
+          Columns:
+            - { Name: repo, Type: string }
+            - { Name: number, Type: int }
+            - { Name: title, Type: string }
+            - { Name: model, Type: string }
+            - { Name: sha, Type: string }
+            - { Name: created_at, Type: string }
+            - { Name: high, Type: int }
+            - { Name: medium, Type: int }
+            - { Name: low, Type: int }
+            - { Name: input_tokens, Type: int }
+            - { Name: output_tokens, Type: int }
+            - { Name: cost_usd, Type: double }
+            - { Name: duration_ms, Type: int }
+            - { Name: issues, Type: 'array<struct<path:string,line:int,severity:string,category:string,message:string>>' }
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: reviewbot
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        BytesScannedCutoffPerQuery: 1073741824      # 1 GB cap per query: cost guard
+        ResultConfiguration: { OutputLocation: !Sub 's3://${AnalyticsBucket}/athena-results/' }
+
+  QueryIssuesByCategory:
+    Type: AWS::Athena::NamedQuery
+    DependsOn: AnalyticsTable
+    Properties:
+      Name: issues-by-category
+      Database: reviewbot
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT i.category, i.severity, count(*) AS n
+        FROM reviewbot.reviews CROSS JOIN UNNEST(issues) AS t(i)
+        GROUP BY 1, 2 ORDER BY n DESC
+
+  QueryCostByRepo:
+    Type: AWS::Athena::NamedQuery
+    DependsOn: AnalyticsTable
+    Properties:
+      Name: cost-by-repo-and-model
+      Database: reviewbot
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT repo, model, count(*) AS reviews, round(sum(cost_usd), 4) AS cost_usd,
+               round(avg(duration_ms) / 1000.0, 1) AS avg_seconds
+        FROM reviewbot.reviews GROUP BY 1, 2 ORDER BY cost_usd DESC
+
+  # ---------- Monitoring ----------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlertSubscription2:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail2
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail2
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt JobDLQ.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ReviewerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ReviewerFunction }]
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  DashboardServerAlarm:          # the EC2 instance or its host is unhealthy
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [{ Name: InstanceId, Value: !Ref DashboardInstance }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching       # a stopped or missing instance sends no data: treat as down
+      AlarmActions: [!Ref AlertTopic]
+
+  # ---------- Budget: emails at $25 / $40 / $55 of real usage. Credits are excluded on purpose,
+  # otherwise the net cost stays $0 until the credits run out and nothing would ever fire. ----------
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasEmail
+    Properties:
+      Budget:
+        BudgetName: reviewbot-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: 80, Unit: USD }
+        CostTypes: { IncludeCredit: false, IncludeRefund: false }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, ThresholdType: ABSOLUTE_VALUE, Threshold: 25 }
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+            - !If [HasEmail2, { SubscriptionType: EMAIL, Address: !Ref AlertEmail2 }, !Ref 'AWS::NoValue']
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, ThresholdType: ABSOLUTE_VALUE, Threshold: 40 }
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+            - !If [HasEmail2, { SubscriptionType: EMAIL, Address: !Ref AlertEmail2 }, !Ref 'AWS::NoValue']
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, ThresholdType: ABSOLUTE_VALUE, Threshold: 55 }
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+            - !If [HasEmail2, { SubscriptionType: EMAIL, Address: !Ref AlertEmail2 }, !Ref 'AWS::NoValue']
+
+Outputs:
+  WebhookUrl:
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhook
+  DashboardUrl: { Value: !Sub 'https://${DashboardCDN.DomainName}' }
+  DashboardInstanceId: { Value: !Ref DashboardInstance }
+  ReleaseBucketName: { Value: !Ref ReleaseBucket }
+  ReviewsTableName: { Value: !Ref ReviewsTable }
+  AlertTopicArn: { Value: !Ref AlertTopic }
+  AnalyticsBucketName: { Value: !Ref AnalyticsBucket }
+  AthenaWorkGroupName: { Value: !Ref AthenaWorkGroup }
