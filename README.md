@@ -8,6 +8,7 @@ GitHub webhook -> API Gateway -> Receiver Lambda -> SQS -> Reviewer Lambda -> Gi
                                                                    |-> S3 JSON   (Athena queries it)
                                                                    '-> Slack alert on high-severity issues
 Dashboard: Flask on EC2 behind CloudFront + WAF.   EventBridge (Mon 13:00 UTC) -> Report Lambda -> SNS email.
+Repo scan tab: dashboard -> SQS (reviewbot-scan-jobs) -> Scan Lambda (15 min) -> GitHub files -> bandit + secrets + Claude -> DynamoDB.
 ```
 
 ## Features
@@ -19,6 +20,9 @@ Dashboard: Flask on EC2 behind CloudFront + WAF.   EventBridge (Mon 13:00 UTC) -
 | **Review settings** | Per repo: Haiku or Sonnet, and a max cost per review (worst-case estimate; the review stops early and says so). |
 | **Filters + detail** | Search and filter by repo, model, severity. Click a row for the full issue list. |
 | **Learning from feedback** | 👍/👎 on an issue is stored; the next reviews of that repo get the latest ones in the prompt. |
+| **Full-file context** | Claude sees each changed file in full (up to 25 files, 40k chars each), not just the diff, but only comments on changed lines. |
+| **Scanners** | Before Claude, `bandit` (Python security linter) and a secret scanner run on the changed files. Bandit findings go into the prompt for Claude to explain and rank; a leaked key is always posted as a high-severity comment. `semgrep` and `eslint` are not included: they don't fit a plain Lambda zip (add them later in a container image). |
+| **Repo scan tab** | Pick a connected repo, model and cost cap. The Scan Lambda reads up to 80 prioritised files (config and auth code first), runs the scanners, has Claude audit them against best practice, and saves a health score, a best-practice checklist (README, tests, CI, lockfile, SECURITY.md, no committed `.env`...) and issues with a suggested fix each. One scan per repo at a time. |
 | **Slack alerts** | Optional. A message when a review finds a high-severity issue. |
 | **Weekly report** | EventBridge schedule -> Lambda -> SNS email (set `AlertEmail`). |
 | **Athena** | Every review is also written to S3; query it in the `reviewbot` workgroup (two saved queries included). |

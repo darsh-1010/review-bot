@@ -24,8 +24,12 @@ Parameters:
   WebAclArn:
     Type: String
     Default: ''             # optional: output of scripts/create-waf.sh (the web ACL is made in us-east-1 by the CLI)
+  DashboardAmi:
+    Type: String
+    Default: ''             # optional: the server's current AMI id. Empty = newest Amazon Linux, which REPLACES the server whenever AWS publishes a new one
 
 Conditions:
+  HasAmi: !Not [!Equals [!Ref DashboardAmi, '']]
   FirstDeploy: !Equals [!Ref DashboardOrigin, '']
   HasEmail: !Not [!Equals [!Ref AlertEmail, '']]
   HasEmail2: !Not [!Equals [!Ref AlertEmail2, '']]
@@ -74,6 +78,18 @@ Resources:
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt JobDLQ.Arn
         maxReceiveCount: 3
+
+  # Whole-repo scans started from the dashboard's "Repo scan" tab. A fixed name lets the dashboard find it without extra config.
+  ScanQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: reviewbot-scan-jobs
+      VisibilityTimeout: 5400          # 6x the scan Lambda timeout
+      SqsManagedSseEnabled: true
+
+  ScanLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /reviewbot/scan, RetentionInDays: 7 }
 
   ReceiverLogs:
     Type: AWS::Logs::LogGroup
@@ -152,6 +168,40 @@ Resources:
             ScalingConfig:
               MaximumConcurrency: 2
 
+  # Same code package as the reviewer; a longer timeout because a whole repo takes minutes, not seconds.
+  # The handler never raises (a failure is saved on the scan row), so SQS never retries and Claude is never paid twice.
+  ScanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/reviewer/
+      Handler: scan.handler
+      MemorySize: 512
+      Timeout: 900
+      LoggingConfig:
+        LogGroup: !Ref ScanLogs
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ReviewsTable }
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/anthropic-api-key
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/github-token
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/reviewbot/gh/*
+      Environment:
+        Variables:
+          CLAUDE_MODEL: !Ref ClaudeModel
+          CLAUDE_KEY_PARAM: /reviewbot/anthropic-api-key
+          GITHUB_TOKEN_PARAM: /reviewbot/github-token
+      Events:
+        Scans:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ScanQueue.Arn
+            BatchSize: 1
+            ScalingConfig:
+              MaximumConcurrency: 2
+
   # ---------- Weekly report (EventBridge schedule -> Lambda -> SNS email) ----------
   ReportFunction:
     Type: AWS::Serverless::Function
@@ -204,6 +254,9 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub ${ReleaseBucket.Arn}/*
+              - Effect: Allow                  # "Repo scan" tab queues a scan job
+                Action: [sqs:SendMessage, sqs:GetQueueUrl]
+                Resource: !GetAtt ScanQueue.Arn
 
   DashboardProfile:
     Type: AWS::IAM::InstanceProfile
@@ -223,7 +276,7 @@ Resources:
   DashboardInstance:
     Type: AWS::EC2::Instance
     Properties:
-      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      ImageId: !If [HasAmi, !Ref DashboardAmi, '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}']
       InstanceType: t3.micro
       IamInstanceProfile: !Ref DashboardProfile
       SecurityGroupIds: [!GetAtt DashboardSG.GroupId]

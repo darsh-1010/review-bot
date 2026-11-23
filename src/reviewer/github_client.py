@@ -1,6 +1,8 @@
 """GitHub REST calls with stdlib only (no requests dependency)."""
+import base64
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API = "https://api.github.com"
@@ -45,3 +47,29 @@ def post_review(repo, number, token, sha, body, comments):
     """event=COMMENT always: the bot can never approve or request changes."""
     return _call("POST", f"/repos/{repo}/pulls/{number}/reviews", token,
                  {"commit_id": sha, "event": "COMMENT", "body": body, "comments": comments})
+
+
+def get_file(repo, path, ref, token, max_bytes=60_000):
+    """Text of one file at a commit, or None (missing, binary, or bigger than max_bytes)."""
+    try:
+        d = _call("GET", f"/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={ref}", token)
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 404):
+            return None
+        raise
+    if not isinstance(d, dict) or d.get("encoding") != "base64" or d.get("size", 0) > max_bytes:
+        return None
+    try:
+        return base64.b64decode(d["content"]).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def get_tree(repo, ref, token):
+    """Every file in the repo at a ref: [{path, size}]. Also says if GitHub cut the list short."""
+    d = _call("GET", f"/repos/{repo}/git/trees/{urllib.parse.quote(ref)}?recursive=1", token)
+    return [{"path": t["path"], "size": t.get("size", 0)} for t in d["tree"] if t["type"] == "blob"], d.get("truncated", False)
+
+
+def get_repo(repo, token):
+    return _call("GET", f"/repos/{repo}", token)

@@ -164,7 +164,25 @@ async function loadAccounts() {
   $("account").replaceChildren(el("option", { value: "", textContent: accts.length ? "GitHub account" : "(add an account first)" }),
     ...accts.map((a) => el("option", { value: a.login, textContent: a.login })));
   $("account").value = keep;
+  if (!$("account").value && accts.length === 1) $("account").value = accts[0].login;  // only one: pre-pick it
+  await loadPicker();
 }
+
+// the repo dropdown: ask GitHub (through the dashboard) what the chosen account can reach
+async function loadPicker() {
+  const acct = $("account").value, sel = $("repo");
+  const opt = (value, text) => el("option", { value, textContent: text });
+  sel.replaceChildren(opt("", acct ? "Loading repos..." : "Pick an account first"));
+  if (!acct) return;
+  try {
+    const names = await api("GET", `/api/accounts/${encodeURIComponent(acct)}/repos`);
+    sel.replaceChildren(opt("", names.length ? "Choose a repo" : "No repos left to connect"), ...names.map((n) => opt(n, n)));
+  } catch (e) {
+    sel.replaceChildren(opt("", "Could not load repos"));
+    $("msg").textContent = e.message;
+  }
+}
+$("account").onchange = loadPicker;
 
 async function actAcct(fn, ok) {
   $("amsg").style.color = "";
@@ -191,6 +209,10 @@ async function loadRepos() {
       act(() => api("DELETE", "/api/repos", { repo: r.repo }), "Removed " + r.repo);
     return el("div", { className: "repo" }, el("b", { textContent: r.repo + (r.account ? " · " + r.account : "") }), model, "max $", cap, save, del);
   }));
+  const skeep = $("srepo").value;
+  $("srepo").replaceChildren(el("option", { value: "", textContent: repos.length ? "Choose a connected repo" : "Connect a repo first" }),
+    ...repos.map((r) => el("option", { value: r.repo, textContent: r.repo })));
+  $("srepo").value = skeep;
   const keep = $("frepo").value;
   $("frepo").replaceChildren(el("option", { value: "", textContent: "All repos" }),
     ...[...new Set([...repos.map((r) => r.repo), ...reviews.map((r) => r.repo)])].sort().map((n) => el("option", { value: n, textContent: n })));
@@ -199,7 +221,7 @@ async function loadRepos() {
 
 async function act(fn, ok) {
   $("msg").style.color = "";
-  try { await fn(); $("msg").textContent = ok; $("msg").style.color = "#34d399"; await loadRepos(); }
+  try { await fn(); $("msg").textContent = ok; $("msg").style.color = "#34d399"; await loadRepos(); await loadPicker(); }
   catch (e) { $("msg").textContent = e.message; }
 }
 
@@ -207,6 +229,90 @@ $("connect").onclick = () => act(async () => {
   await api("POST", "/api/repos", { repo: $("repo").value, account: $("account").value, model: $("model").value, max_cost_usd: +$("cap").value });
   $("repo").value = "";
 }, "Connected: open a pull request there to try it.");
+
+// ---------- tabs ----------
+function showTab(name) {
+  for (const t of ["reviews", "scan"]) {
+    $("tab-" + t).hidden = t !== name;
+    $("tabbtn-" + t).classList.toggle("on", t === name);
+  }
+  if (name === "scan") loadScans();
+}
+$("tabbtn-reviews").onclick = () => showTab("reviews");
+$("tabbtn-scan").onclick = () => showTab("scan");
+
+// ---------- repo scan: queue a job, poll while one is running, show score + checklist + issues with fixes ----------
+let scans = [], scanTimer;
+const when = (s) => s.time.slice(0, 19).replace("T", " ");
+
+async function loadScans() {
+  clearTimeout(scanTimer);
+  try { scans = await api("GET", "/api/scans"); } catch (e) { $("smsg").textContent = e.message; return; }
+  renderScans();
+  if (scans.some((s) => s.status === "queued" || s.status === "running") && !$("tab-scan").hidden)
+    scanTimer = setTimeout(loadScans, 5000);  // stop polling when nothing is running or the tab is hidden
+}
+
+function renderScans() {
+  if (!scans.length) return $("srows").replaceChildren(el("tr", {}, el("td", { colSpan: 9, textContent: "No scans yet." })));
+  $("srows").replaceChildren(...scans.map((s) => {
+    const done = s.status === "done";
+    const n = (k) => (done ? (s.issues || []).filter((i) => i.severity === k).length : "");
+    const cells = [when(s), s.repo, el("span", { className: "st-" + s.status, textContent: s.status }),
+                   done ? s.score : "", n("high"), n("medium"), n("low"),
+                   done ? `${s.files_scanned}/${s.files_total}` : "", done ? (s.cost_micro / 1e6).toFixed(4) : ""];
+    const tr = el("tr", {}, ...cells.map((v, i) => el("td", { className: i >= 3 ? "num" : "" }, v)));
+    tr.onclick = () => openScan(s);
+    return tr;
+  }));
+}
+
+function openScan(s) {
+  const box = $("box");
+  const close = el("button", { textContent: "Close" });
+  close.onclick = () => ($("modal").style.display = "none");
+  box.replaceChildren(el("h3", { textContent: `${s.repo} · scan` }),
+    el("div", { className: "meta", textContent: `${when(s)} UTC · ${s.model}` + (s.branch ? ` · branch ${s.branch}` : "") }));
+  if (s.status !== "done") {
+    box.append(el("p", { className: "st-" + s.status,
+                         textContent: s.status === "failed" ? "Scan failed: " + (s.error || "unknown error") : "Scan is " + s.status + "... this takes a few minutes." }),
+               el("div", { className: "row" }, close));
+  } else {
+    const issues = s.issues || [], count = (k) => issues.filter((i) => i.severity === k).length;
+    box.append(
+      el("div", { className: "row", style: "align-items:flex-end;gap:24px;margin-top:10px" },
+        el("div", {}, el("small", { textContent: "HEALTH SCORE" }), el("div", { className: "score", textContent: s.score })),
+        el("div", {}, tag(count("high"), "t-hi"), " high  ", tag(count("medium"), "t-md"), " medium  ", tag(count("low"), "t-lo"), " low"),
+        el("div", { className: "meta", textContent: `${s.files_scanned} of ${s.files_total} files scanned · $${(s.cost_micro / 1e6).toFixed(4)} · ${(s.duration_ms / 1000).toFixed(0)}s` })));
+    (s.notes || []).forEach((n) => box.append(el("p", { className: "msg", textContent: "Note: " + n })));
+    (s.summaries || []).forEach((t) => box.append(el("p", { style: "color:var(--muted)", textContent: t })));
+    box.append(el("h3", { textContent: "Best-practice checklist", style: "margin-top:18px" }));
+    (s.checks || []).forEach((c) => box.append(el("div", { className: "chk" },
+      el("span", { className: c.ok ? "ok" : "bad", textContent: c.ok ? "✓" : "✗" }),
+      el("div", {}, c.name, c.ok ? "" : el("div", { className: "sug", textContent: c.hint })))));
+    box.append(el("h3", { textContent: `Issues (${issues.length})`, style: "margin-top:18px" }));
+    if (!issues.length) box.append(el("p", { textContent: "No issues found." }));
+    issues.forEach((i) => {
+      const href = `https://github.com/${s.repo}/blob/${encodeURIComponent(s.branch || "HEAD")}/${i.path.split("/").map(encodeURIComponent).join("/")}#L${i.line}`;
+      box.append(el("div", { className: "issue" },
+        el("div", { className: "meta" }, tag(i.severity, SEV_CLASS[i.severity]), ` ${i.category} · `,
+           el("a", { href, target: "_blank", rel: "noopener", textContent: `${i.path}:${i.line}` })),
+        el("p", { textContent: i.message }),
+        i.suggestion ? el("div", { className: "sug", textContent: "Fix: " + i.suggestion }) : ""));
+    });
+    box.append(el("div", { className: "row", style: "margin-top:14px" }, close));
+  }
+  $("modal").style.display = "flex";
+}
+
+$("startscan").onclick = async () => {
+  $("smsg").style.color = "";
+  try {
+    await api("POST", "/api/scans", { repo: $("srepo").value, model: $("smodel").value, max_cost_usd: +$("scap").value });
+    $("smsg").textContent = "Scan queued. It usually takes 1-5 minutes."; $("smsg").style.color = "#34d399";
+    await loadScans();
+  } catch (e) { $("smsg").textContent = e.message; }
+};
 
 async function load() {
   const crystal = scene3d();

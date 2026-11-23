@@ -4,6 +4,7 @@ from boto3.dynamodb.conditions import Key
 import claude_client as cc
 import diff_utils as du
 import github_client as gh
+import scanners
 
 ssm = boto3.client("ssm")
 s3 = boto3.client("s3")
@@ -11,6 +12,8 @@ table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
 MODEL = os.environ["CLAUDE_MODEL"]            # default; a repo's own setting overrides it
 DEFAULT_CAP_MICRO = 500_000                   # $0.50 per review unless the repo sets its own
 MAX_INLINE = 5
+MAX_CONTEXT_FILES = 25                         # full-file context for at most this many changed files
+MAX_CONTEXT_CHARS = 40_000                     # per file; longer files are cut
 SEV = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -57,7 +60,8 @@ def review(job):
     hints = feedback_hints(repo)
 
     pr = gh.get_pr(repo, number, token)
-    sections, valid, skipped = [], {}, []
+    reviewable = []
+    skipped = []
     for f in gh.get_files(repo, number, token):
         why = du.skip_reason(f)
         if why:
@@ -65,8 +69,35 @@ def review(job):
             continue
         text, lines = du.number_lines(f["patch"])
         if lines:
-            valid[f["filename"]] = lines
-            sections.append(f"### {f['filename']}\n{text}")
+            reviewable.append((f["filename"], text, lines))
+
+    # Full current contents of the changed files: context for Claude and input for the scanners.
+    # ponytail: sequential GitHub calls, at most MAX_CONTEXT_FILES; parallelise if PRs get huge.
+    full = {}
+    for name, _, _ in reviewable[:MAX_CONTEXT_FILES]:
+        try:
+            text = gh.get_file(repo, name, sha, token)
+        except Exception as e:  # context is a bonus: never fail the review over it
+            print("context fetch failed:", name, repr(e))
+            continue
+        if text is not None:
+            full[name] = text
+    valid = {name: lines for name, _, lines in reviewable}
+    found = [f for f in scanners.scan(full) if f["line"] in valid.get(f["path"], ())]  # only lines this PR touches
+    secrets = [f for f in found if f["tool"] == "secrets"]
+    by_file = {}
+    for f in found:
+        if f["tool"] != "secrets":  # secrets become issues directly, below
+            by_file.setdefault(f["path"], []).append(f)
+
+    sections = []
+    for name, text, _ in reviewable:
+        sec = f"### {name}\n{text}"
+        if name in full:
+            sec += f"\n\n#### Full file (context only)\n{full[name][:MAX_CONTEXT_CHARS]}"
+        if name in by_file:
+            sec += f"\n\n#### Scanner findings\n{scanners.findings_text(by_file[name])}"
+        sections.append(sec)
 
     summaries, issues, tin, tout = [], [], 0, 0
     for c in du.chunk(sections):
@@ -78,6 +109,10 @@ def review(job):
         summaries.append(out["summary"])
         issues += out["issues"]
         tin, tout = tin + usage.input_tokens, tout + usage.output_tokens
+    for f in secrets:  # a leaked key is always reported, even if Claude missed it
+        if not any(i["path"] == f["path"] and i["line"] == f["line"] for i in issues):
+            issues.append({"path": f["path"], "line": f["line"], "severity": "high", "category": "security",
+                           "message": f["message"]})
     issues.sort(key=lambda i: SEV[i["severity"]])
 
     inline, rest = [], []

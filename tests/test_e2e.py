@@ -1,5 +1,5 @@
 """One pass through the whole app on a simulated AWS (moto): GitHub accounts, repos, reviews, feedback, cost cap."""
-import importlib.util, json, os, pathlib, sys, types, urllib.error
+import importlib.util, io, json, os, pathlib, sys, types, urllib.error
 
 os.environ.update(AWS_DEFAULT_REGION="ap-southeast-2", AWS_ACCESS_KEY_ID="x", AWS_SECRET_ACCESS_KEY="x",
                   TABLE_NAME="t", CLAUDE_MODEL="claude-haiku-5-5", ANALYTICS_BUCKET="analytics-bkt",
@@ -20,8 +20,8 @@ def load(name, path):
     return mod
 
 
-def http_error(code):
-    return urllib.error.HTTPError("u", code, "x", {}, None)
+def http_error(code, body=b""):
+    return urllib.error.HTTPError("https://api.github.com/repos/Me/Play/hooks", code, "x", {}, io.BytesIO(body))
 
 
 @mock_aws
@@ -42,6 +42,10 @@ def test_end_to_end(monkeypatch):
             if token and token.startswith("good"):
                 return {"login": "alice"}
             raise http_error(401)
+        if path.startswith("/user/repos"):
+            return [{"full_name": "Me/Play", "permissions": {"admin": True}},
+                    {"full_name": "Me/ReadOnly", "permissions": {"admin": False}},
+                    {"full_name": "Me/Other", "permissions": {"admin": True}}]
         if method == "GET" and path.count("/") == 3:
             return {"full_name": "Me/Play"}
         return {"id": 42} if method == "POST" else None
@@ -59,13 +63,26 @@ def test_end_to_end(monkeypatch):
     accounts = c.get("/api/accounts").get_json()
     assert [a["login"] for a in accounts] == ["alice"] and "good" not in json.dumps(accounts)
     assert c.post("/api/repos", json={"repo": "a/b", "account": "nobody"}).status_code == 400
+    assert c.get("/api/accounts/alice/repos").get_json() == ["Me/Other", "Me/Play"]  # admin only, no read-only repos
+    assert c.get("/api/accounts/nobody/repos").status_code == 404
 
     # --- repos: connecting creates the webhook with that account's token
+    # a token without Webhooks permission: the dashboard must relay GitHub's reason
+    real_gh = dash._gh
+    def denied(method, path, body=None, account=None, token=None):
+        if method == "POST" and path.endswith("/hooks"):
+            raise http_error(403, b'{"message": "Resource not accessible by personal access token"}')
+        return real_gh(method, path, body, account, token)
+    monkeypatch.setattr(dash, "_gh", denied)
+    r = c.post("/api/repos", json={"repo": "me/play", "account": "alice"})
+    assert r.status_code == 502 and "403 on /repos/Me/Play/hooks" in r.get_json()["error"] and "not accessible" in r.get_json()["error"]
+    monkeypatch.setattr(dash, "_gh", real_gh)
     ok = c.post("/api/repos", json={"repo": "https://github.com/me/play", "account": "alice",
                                     "model": "claude-sonnet-5-5", "max_cost_usd": 0.05})
     assert ok.status_code == 201 and ("POST", "/repos/Me/Play/hooks", "alice") in calls
     assert c.post("/api/repos", json={"repo": "nonsense"}).status_code == 400
     assert c.post("/api/repos", json={"repo": "a/b", "model": "gpt"}).status_code == 400
+    assert c.get("/api/accounts/alice/repos").get_json() == ["Me/Other"]  # connected repos drop out of the list
     repo = c.get("/api/repos").get_json()[0]
     assert (repo["repo"], repo["max_cost_micro"], repo["account"]) == ("Me/Play", 50000, "alice")
     assert c.put("/api/repos", json={"repo": "Me/Play", "model": "claude-haiku-5-5", "max_cost_usd": 0.25}).status_code == 200
@@ -82,6 +99,7 @@ def test_end_to_end(monkeypatch):
     posted, seen, slack = [], [], []
     monkeypatch.setattr(rev.gh, "get_pr", lambda *a: {"title": "T", "html_url": "http://pr"})
     monkeypatch.setattr(rev.gh, "get_files", lambda *a: [{"filename": "f.py", "patch": "@@ -1,1 +1,2 @@\n a\n+b"}])
+    monkeypatch.setattr(rev.gh, "get_file", lambda *a: None)  # no full-file context in this test
     monkeypatch.setattr(rev.gh, "post_review", lambda *a: posted.append(a))
     monkeypatch.setattr(rev, "_slack", lambda *a: slack.append(a))
 
@@ -132,3 +150,101 @@ def test_end_to_end(monkeypatch):
     assert c.get("/api/stats").status_code == 401 and c.get("/health").status_code == 200
     auth = {"Authorization": "Basic " + base64.b64encode(b"u:secret").decode()}
     assert c.get("/api/stats", headers=auth).status_code == 200
+
+
+def _table():
+    ddb = boto3.resource("dynamodb")
+    ddb.create_table(TableName="t", BillingMode="PAY_PER_REQUEST",
+                     AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "S"}],
+                     KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}])
+    boto3.client("s3").create_bucket(Bucket="analytics-bkt", CreateBucketConfiguration={"LocationConstraint": "ap-southeast-2"})
+    boto3.client("ssm").put_parameter(Name="/reviewbot/gh/alice", Type="SecureString", Value="tok")
+    ddb.Table("t").put_item(Item={"pk": "REPOS", "sk": "Me/Play", "repo": "Me/Play", "model": "claude-haiku-5-5",
+                                  "account": "alice", "hook_id": 1, "max_cost_micro": 500000})
+    return ddb
+
+
+AKEY = "AKIA" + "ABCDEFGHIJKLMNOP"
+
+
+@mock_aws
+def test_pr_review_gets_full_file_context_and_scanners(monkeypatch):
+    _table()
+    rev = load("rev_app2", "src/reviewer/app.py")
+    prompts, posted = [], []
+    patch = "@@ -1,1 +1,3 @@\n import subprocess\n+subprocess.call(cmd, shell=True)\n+KEY = '" + AKEY + "'"
+    full = "import subprocess\nsubprocess.call(cmd, shell=True)\nKEY = '" + AKEY + "'\n"
+    monkeypatch.setattr(rev, "_claude", lambda: None)
+    monkeypatch.setattr(rev, "_gh_token", lambda a: "tok")
+    monkeypatch.setattr(rev.gh, "get_pr", lambda *a: {"title": "T", "html_url": "http://pr"})
+    monkeypatch.setattr(rev.gh, "get_files", lambda *a: [{"filename": "x.py", "patch": patch}])
+    monkeypatch.setattr(rev.gh, "get_file", lambda repo, path, ref, tok: full)
+    monkeypatch.setattr(rev.gh, "post_review", lambda *a: posted.append(a))
+    monkeypatch.setattr(rev, "_slack", lambda *a: None)
+
+    def fake_chunk(client, model, text, hints=""):
+        prompts.append(text)
+        return {"summary": "s", "issues": []}, types.SimpleNamespace(input_tokens=10, output_tokens=5)
+    monkeypatch.setattr(rev.cc, "review_chunk", fake_chunk)
+    rev.review({"repo": "Me/Play", "number": 1, "head_sha": "abc123", "delivery": "d"})
+
+    assert "Full file (context only)" in prompts[0] and "Scanner findings" in prompts[0]
+    assert "bandit B602" in prompts[0] and AKEY not in prompts[0].split("#### Scanner findings")[1]  # findings never echo the key
+    # Claude reported nothing, but the leaked key is still posted as a high-severity inline comment
+    comments = posted[0][5]
+    assert any("AWS access key" in c["body"] and c["line"] == 3 for c in comments)
+
+
+@mock_aws
+def test_repo_scan_from_dashboard_click_to_saved_result(monkeypatch):
+    ddb = _table()
+    sqs = boto3.client("sqs")
+    sqs.create_queue(QueueName="reviewbot-scan-jobs")
+    dash, scan = load("dash_app2", "dashboard/app.py"), load("scan_mod", "src/reviewer/scan.py")
+    c = dash.app.test_client()
+
+    assert c.post("/api/scans", json={"repo": "Nope/x"}).status_code == 404
+    assert c.post("/api/scans", json={"repo": "Me/Play", "max_cost_usd": 99}).status_code == 400
+    r = c.post("/api/scans", json={"repo": "Me/Play", "model": "claude-haiku-5-5", "max_cost_usd": 0.5})
+    assert r.status_code == 202
+    assert c.post("/api/scans", json={"repo": "Me/Play"}).status_code == 409  # one at a time per repo
+    url = sqs.get_queue_url(QueueName="reviewbot-scan-jobs")["QueueUrl"]
+    msg = sqs.receive_message(QueueUrl=url)["Messages"][0]["Body"]
+
+    files = {"app.py": "import subprocess\nsubprocess.call(cmd, shell=True)\n", ".env": "AWS_KEY=" + AKEY + "\n"}
+    tree = [{"path": p, "size": len(t)} for p, t in files.items()] + [{"path": "README.md", "size": 5}, {"path": "logo.png", "size": 9}]
+    monkeypatch.setattr(scan.app, "_claude", lambda: None)
+    monkeypatch.setattr(scan.app, "_gh_token", lambda a: "tok")
+    monkeypatch.setattr(scan.gh, "get_repo", lambda *a: {"default_branch": "main"})
+    monkeypatch.setattr(scan.gh, "get_tree", lambda *a: (tree, False))
+    monkeypatch.setattr(scan.gh, "get_file", lambda repo, p, ref, tok, mx=0: files.get(p))
+    seen = []
+
+    def fake_scan(client, model, text):
+        seen.append(text)
+        issue = {"path": "app.py", "line": 2, "severity": "high", "category": "security",
+                 "message": "shell injection", "suggestion": "pass a list, no shell=True"}
+        return {"summary": "A tiny app.", "issues": [issue]}, types.SimpleNamespace(input_tokens=2000, output_tokens=300)
+    monkeypatch.setattr(scan.cc, "scan_chunk", fake_scan)
+    ctx = types.SimpleNamespace(get_remaining_time_in_millis=lambda: 800_000)
+
+    scan.handler({"Records": [{"body": msg}]}, ctx)
+    row = c.get("/api/scans").get_json()[0]
+    assert row["status"] == "done" and row["files_scanned"] == 2 and row["files_total"] == 4 and row["branch"] == "main"
+    assert "L2 subprocess.call" in seen[0] and "Scanner findings" in seen[0]
+    got = {(i["path"], i["line"]) for i in row["issues"]}
+    assert ("app.py", 2) in got and (".env", 1) in got                      # Claude's issue + the leaked key
+    assert row["issues"][0]["severity"] == "high" and row["cost_micro"] > 0
+    assert {ch["name"]: ch["ok"] for ch in row["checks"]}["No .env file committed"] is False and row["score"] < 80
+
+    n = len(seen)
+    scan.handler({"Records": [{"body": msg}]}, ctx)                          # duplicate delivery: no second Claude bill
+    assert len(seen) == n
+
+    # a failure is saved on the row and never re-raised (a raise would make SQS retry and pay again)
+    sk2 = "2999-01-01T00:00:00+00:00#Me/Play"
+    ddb.Table("t").put_item(Item={"pk": "SCAN", "sk": sk2, "repo": "Me/Play", "status": "queued", "model": "claude-haiku-5-5"})
+    monkeypatch.setattr(scan.gh, "get_repo", lambda *a: 1 / 0)
+    scan.handler({"Records": [{"body": json.dumps({"sk": sk2, "repo": "Me/Play", "model": "claude-haiku-5-5", "max_cost_micro": 500000})}]}, ctx)
+    failed = ddb.Table("t").get_item(Key={"pk": "SCAN", "sk": sk2})["Item"]
+    assert failed["status"] == "failed" and "division" in failed["error"]

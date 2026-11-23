@@ -1,4 +1,4 @@
-import functools, hmac, json, os, re, time, urllib.error, urllib.request
+import datetime, functools, hmac, json, os, re, time, urllib.error, urllib.request
 import boto3
 from boto3.dynamodb.conditions import Key
 from flask import Flask, Response, abort, render_template, request
@@ -6,6 +6,8 @@ from flask import Flask, Response, abort, render_template, request
 app = Flask(__name__)
 table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])  # creds come from the instance role
 ssm = boto3.client("ssm")
+sqs = boto3.client("sqs")
+SCAN_STALE_S = 30 * 60  # a scan Lambda lives 15 min; anything "running" longer than 30 died
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5")
 REPO_RE = re.compile(r"^(?:https?://github\.com/)?([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 
@@ -163,6 +165,24 @@ def remove_account():
     return _json({"removed": login})
 
 
+@app.get("/api/accounts/<login>/repos")
+def account_repos(login):
+    """Repos this account's token can reach and may add a webhook to (admin), minus the ones already connected."""
+    if "Item" not in table.get_item(Key={"pk": "GHACCT", "sk": login}):
+        return _err("account not found", 404)
+    connected = {r["repo"] for r in table.query(KeyConditionExpression=Key("pk").eq("REPOS"))["Items"]}
+    names = []
+    try:
+        for page in (1, 2, 3):  # ponytail: first 300 repos, newest activity first
+            batch = _gh("GET", f"/user/repos?per_page=100&page={page}&sort=updated", account=login)
+            names += [r["full_name"] for r in batch if r.get("permissions", {"admin": True}).get("admin")]
+            if len(batch) < 100:
+                break
+    except urllib.error.HTTPError as e:
+        return _err(f"GitHub answered {e.code} while listing repos", 502)
+    return _json(sorted(n for n in names if n not in connected))
+
+
 @app.get("/api/repos")
 def repos():
     return _json(table.query(KeyConditionExpression=Key("pk").eq("REPOS"))["Items"])
@@ -191,7 +211,12 @@ def add_repo():
                 raise
             hook = next(h for h in _gh("GET", f"/repos/{repo}/hooks", account=account) if h["config"].get("url") == hook_url)
     except urllib.error.HTTPError as e:
-        return _err(f"GitHub answered {e.code}: the token needs Webhooks write access to {m.group(1)}", 502)
+        try:  # GitHub says exactly what is missing, e.g. "Resource not accessible by personal access token"
+            why = json.loads(e.read()).get("message", "")
+        except Exception:
+            why = ""
+        step = e.url.split("api.github.com")[-1].split("?")[0]  # which call failed; never includes the token
+        return _err(f"GitHub answered {e.code} on {step}: {why or 'no details'}", 502)
     except StopIteration:
         return _err("a different webhook blocks this repo; remove it in GitHub settings", 409)
     item = {"pk": "REPOS", "sk": repo, "repo": repo, "hook_id": hook["id"], **s, **({"account": account} if account else {})}
@@ -227,6 +252,44 @@ def remove_repo():
             return _err(f"GitHub answered {e.code} while removing the webhook", 502)
     table.delete_item(Key={"pk": "REPOS", "sk": repo})
     return _json({"removed": repo})
+
+
+# ---------- repo scans: the Scan Lambda does the work; this only queues a job and shows the saved result ----------
+def _scan_rows():
+    items = table.query(KeyConditionExpression=Key("pk").eq("SCAN"), ScanIndexForward=False, Limit=15)["Items"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for i in items:
+        age = (now - datetime.datetime.fromisoformat(i["sk"].split("#")[0])).total_seconds()
+        if i["status"] in ("queued", "running") and age > SCAN_STALE_S:
+            i.update(status="failed", error="timed out: the scan did not finish")
+        i["time"] = i["sk"].split("#")[0]
+    return items
+
+
+@app.get("/api/scans")
+def scans():
+    return _json(_scan_rows())
+
+
+@app.post("/api/scans")
+def start_scan():
+    d = request.get_json(silent=True) or {}
+    repo = d.get("repo")
+    item = table.get_item(Key={"pk": "REPOS", "sk": repo}).get("Item") if isinstance(repo, str) else None
+    if not item:
+        return _err("connect the repo first", 404)
+    s = _settings({"model": d.get("model", item.get("model", MODELS[0])), "max_cost_usd": d.get("max_cost_usd", 1.0)})
+    if isinstance(s, str):
+        return _err(s)
+    for i in _scan_rows():  # one scan per repo at a time: every scan costs money
+        if i["repo"] == repo and i["status"] in ("queued", "running"):
+            return _err("a scan of this repo is already running", 409)
+    sk = f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}#{repo}"
+    table.put_item(Item={"pk": "SCAN", "sk": sk, "repo": repo, "status": "queued", "model": s["model"],
+                         "expires_at": int(time.time()) + 90 * 86400})
+    q = sqs.get_queue_url(QueueName=os.environ.get("SCAN_QUEUE_NAME", "reviewbot-scan-jobs"))["QueueUrl"]
+    sqs.send_message(QueueUrl=q, MessageBody=json.dumps({"sk": sk, "repo": repo, **s}))
+    return _json({"sk": sk, "status": "queued"}, 202)
 
 
 @app.get("/health")

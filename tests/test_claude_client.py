@@ -28,3 +28,10 @@ def test_cost_cap_blocks_a_huge_chunk():
     cap = 100_000  # $0.10; a 240k-token Sonnet chunk is worst-case far above that
     assert cc.estimate_micro("claude-sonnet-5-5", "a" * 960_000) > cap
     assert cc.estimate_micro("claude-haiku-5-5", "a" * 4_000) < cap
+
+
+def test_review_chunk_skips_thinking_block():
+    from types import SimpleNamespace as N
+    resp = N(content=[N(type="thinking"), N(type="text", text='{"summary": "s", "issues": []}')], usage="u")
+    client = N(messages=N(create=lambda **kw: resp))
+    assert cc.review_chunk(client, "claude-haiku-5-5", "d") == ({"summary": "s", "issues": []}, "u")

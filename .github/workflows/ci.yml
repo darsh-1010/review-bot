@@ -9,6 +9,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with: { python-version: '3.13' }
-      - run: pip install anthropic boto3 flask pytest 'moto[dynamodb,ssm,s3]' cfn-lint
+      - run: pip install anthropic boto3 flask pytest 'moto[dynamodb,ssm,s3,sqs]' bandit cfn-lint
       - run: pytest -q
       - run: cfn-lint template.yaml
