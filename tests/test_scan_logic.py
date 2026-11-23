@@ -40,10 +40,10 @@ def test_checklist_good_and_bad_repo():
                                     "Pinned Python requirements", "Dependency update bot", "Security policy", "No .env file committed"])
 
 
-def test_score_floor_and_weights():
+def test_score_caps_and_weights():
     one = lambda s: [{"severity": s}]  # noqa: E731
     assert scan.score(one("high"), []) == 88 and scan.score(one("low"), []) == 99
-    assert scan.score([{"severity": "high"}] * 20, []) == 0
+    assert scan.score([{"severity": "high"}] * 20, []) == 50
 
 
 def test_weekly_report_lists_only_repos_whose_score_dropped():
