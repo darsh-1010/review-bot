@@ -44,3 +44,13 @@ def test_score_floor_and_weights():
     one = lambda s: [{"severity": s}]  # noqa: E731
     assert scan.score(one("high"), []) == 88 and scan.score(one("low"), []) == 99
     assert scan.score([{"severity": "high"}] * 20, []) == 0
+
+
+def test_weekly_report_lists_only_repos_whose_score_dropped():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("report_app", pathlib.Path(__file__).parent.parent / "src/report/app.py")
+    import os; os.environ.setdefault("TABLE_NAME", "t"); os.environ.setdefault("AWS_DEFAULT_REGION", "ap-southeast-2")
+    rep = importlib.util.module_from_spec(spec); spec.loader.exec_module(rep)
+    mk = lambda day, repo, score: {"sk": f"2026-11-{day}T00:00:00#{repo}", "repo": repo, "status": "done", "score": score, "issues": [{"severity": "high"}]}  # noqa: E731
+    text = "\n".join(rep.scan_section([mk("01", "a/b", 90), mk("08", "a/b", 70), mk("01", "c/d", 50), mk("08", "c/d", 80), mk("08", "e/f", 10)]))
+    assert "a/b: score 90 -> 70" in text and "c/d" not in text and "e/f" not in text

@@ -23,6 +23,22 @@ def summarize(items, since):
     return "\n".join(lines)
 
 
+def scan_section(scans):
+    """Repos whose latest finished scan scores worse than the one before, plus repos with new high-severity issues."""
+    by_repo = {}
+    for i in sorted((i for i in scans if i.get("status") == "done"), key=lambda i: i["sk"]):
+        by_repo.setdefault(i["repo"], []).append(i)
+    lines = []
+    for repo, runs in sorted(by_repo.items()):
+        if len(runs) < 2:
+            continue
+        old, new = runs[-2], runs[-1]
+        highs = sum(1 for x in new.get("issues", []) if x["severity"] == "high")
+        if int(new["score"]) < int(old["score"]):
+            lines.append(f"  {repo}: score {int(old['score'])} -> {int(new['score'])} ({highs} high-severity issues now)")
+    return ["", "Repo scans that got worse since the previous scan:"] + lines if lines else []
+
+
 def handler(event, context):
     since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).isoformat()
     items, kw = [], dict(KeyConditionExpression=Key("pk").eq("REVIEW") & Key("sk").gte(since))
@@ -32,5 +48,7 @@ def handler(event, context):
         if "LastEvaluatedKey" not in r:
             break
         kw["ExclusiveStartKey"] = r["LastEvaluatedKey"]
+    month = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=45)).isoformat()
+    scans = table.query(KeyConditionExpression=Key("pk").eq("SCAN") & Key("sk").gte(month))["Items"]
     sns.publish(TopicArn=os.environ["TOPIC_ARN"], Subject="ReviewBot weekly report",
-                Message=summarize(items, since))
+                Message="\n".join([summarize(items, since)] + scan_section(scans)))

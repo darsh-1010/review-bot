@@ -73,3 +73,17 @@ def get_tree(repo, ref, token):
 
 def get_repo(repo, token):
     return _call("GET", f"/repos/{repo}", token)
+
+
+def get_commit_patches(repo, token, n=25):
+    """Added lines of the last n commits: [(sha, {path: added_text})]. Secrets deleted later still live in history."""
+    out = []
+    for c in _call("GET", f"/repos/{repo}/commits?per_page={n}", token)[:n]:
+        d = _call("GET", f"/repos/{repo}/commits/{c['sha']}", token)
+        added = {}
+        for f in d.get("files", []):
+            lines = [l[1:] for l in (f.get("patch") or "").splitlines() if l.startswith("+") and not l.startswith("+++")]
+            if lines:
+                added[f["filename"]] = "\n".join(lines)
+        out.append((c["sha"], added))
+    return out

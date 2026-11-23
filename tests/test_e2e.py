@@ -218,9 +218,10 @@ def test_repo_scan_from_dashboard_click_to_saved_result(monkeypatch):
     monkeypatch.setattr(scan.gh, "get_repo", lambda *a: {"default_branch": "main"})
     monkeypatch.setattr(scan.gh, "get_tree", lambda *a: (tree, False))
     monkeypatch.setattr(scan.gh, "get_file", lambda repo, p, ref, tok, mx=0: files.get(p))
+    monkeypatch.setattr(scan.gh, "get_commit_patches", lambda *a: [])
     seen = []
 
-    def fake_scan(client, model, text):
+    def fake_scan(client, model, text, ptype="web"):
         seen.append(text)
         issue = {"path": "app.py", "line": 2, "severity": "high", "category": "security",
                  "message": "shell injection", "suggestion": "pass a list, no shell=True"}
@@ -248,3 +249,57 @@ def test_repo_scan_from_dashboard_click_to_saved_result(monkeypatch):
     scan.handler({"Records": [{"body": json.dumps({"sk": sk2, "repo": "Me/Play", "model": "claude-haiku-5-5", "max_cost_micro": 500000})}]}, ctx)
     failed = ddb.Table("t").get_item(Key={"pk": "SCAN", "sk": sk2})["Item"]
     assert failed["status"] == "failed" and "division" in failed["error"]
+
+
+@mock_aws
+def test_ai_repo_scan_end_to_end(monkeypatch):
+    """AI project: auto-detected, rule + OSV + history + prompt-secret findings are all saved, prompt is graded."""
+    _table()
+    scan = load("scan_mod2", "src/reviewer/scan.py")
+    code = ('import anthropic\nclient = anthropic.Anthropic()\n'
+            'SYSTEM_PROMPT = """You are SupportBot. Your task is to help customers. password: hunter2hunter2 for the admin db. xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"""\n'
+            'r = client.messages.create(model="m", messages=[])\nexec(r.content)\n')
+    files = {"bot.py": code}
+    tree = [{"path": "bot.py", "size": len(code)}, {"path": "requirements.txt", "size": 20}]
+    monkeypatch.setattr(scan.app, "_claude", lambda: None)
+    monkeypatch.setattr(scan.app, "_gh_token", lambda a: "tok")
+    monkeypatch.setattr(scan.gh, "get_repo", lambda *a: {"default_branch": "main"})
+    monkeypatch.setattr(scan.gh, "get_tree", lambda *a: (tree, False))
+    monkeypatch.setattr(scan.gh, "get_file", lambda repo, p, ref, tok, mx=0: code if p == "bot.py" else "flask==0.12\n")
+    monkeypatch.setattr(scan.gh, "get_commit_patches", lambda *a: [("abc1234def", {"old.py": 'k = "' + AKEY + '"\n'})])
+    monkeypatch.setattr(scan.deps, "audit", lambda m: ([{"path": "requirements.txt", "line": 1, "severity": "high", "tool": "osv",
+                        "rule": "GHSA-x", "category": "dependencies", "message": "flask 0.12 vulnerable", "suggestion": "Upgrade"}], "1 advisory"))
+    monkeypatch.setattr(scan.cc, "scan_chunk", lambda c, m, t, ptype="web": (
+        {"summary": "bot", "issues": []}, types.SimpleNamespace(input_tokens=1000, output_tokens=100)))
+    monkeypatch.setattr(scan.cc, "prompt_review", lambda c, m, p: (
+        {"prompts": [{"path": p[0]["path"], "line": 3, "score": 3, "rubric": [], "improved": "better"}], "test_yaml": "tests: []"},
+        types.SimpleNamespace(input_tokens=500, output_tokens=500)))
+    sk = "2999-02-01T00:00:00+00:00#Me/Play"
+    scan.app.table.put_item(Item={"pk": "SCAN", "sk": sk, "repo": "Me/Play", "status": "queued", "model": "claude-haiku-5-5"})
+    job = {"sk": sk, "repo": "Me/Play", "model": "claude-haiku-5-5", "max_cost_micro": 500000, "project_type": "auto"}
+    scan.handler({"Records": [{"body": json.dumps(job)}]}, types.SimpleNamespace(get_remaining_time_in_millis=lambda: 800_000))
+    row = scan.app.table.get_item(Key={"pk": "SCAN", "sk": sk})["Item"]
+    assert row["status"] == "done" and row["project_type"] == "ai" and row["detected"] is True
+    rules = {i.get("owasp") for i in row["issues"]}
+    assert "LLM05 Improper Output Handling" in rules or any(i["message"].startswith("eval/exec") for i in row["issues"])
+    assert any(i["category"] == "dependencies" for i in row["issues"])
+    assert any(i.get("commit") == "abc1234def" for i in row["issues"])          # key deleted from the code, still in history
+    assert any("credential or connection string appears inside a prompt" in i["message"] for i in row["issues"])
+    assert row["prompts"][0]["score"] == 3 and row["test_yaml"] == "tests: []"
+    assert any(c["name"] == "Every LLM call has a max-token limit" and c["ok"] is False for c in row["checks"])
+
+
+@mock_aws
+def test_scan_project_type_validation_and_fix_pr_files():
+    _table()
+    dash = load("dash_app3", "dashboard/app.py")
+    c = dash.app.test_client()
+    assert c.post("/api/scans", json={"repo": "Me/Play", "project_type": "bogus"}).status_code == 400
+    files = dash._fix_files(["app.py", "requirements.txt", ".github/workflows/ci.yml"],
+                            [{"name": "Security policy", "ok": False}, {"name": ".gitignore", "ok": False},
+                             {"name": "Dependency update bot", "ok": False}, {"name": "README", "ok": False}])
+    assert set(files) == {"SECURITY.md", ".gitignore", ".github/dependabot.yml"}
+    assert 'package-ecosystem: "pip"' in files[".github/dependabot.yml"] and 'github-actions' in files[".github/dependabot.yml"]
+    assert "__pycache__/" in files[".gitignore"] and ".env" in files[".gitignore"]
+    assert dash._fix_files(["a.py"], [{"name": "README", "ok": False}]) == {}   # judgement calls are never auto-fixed
+    assert c.post("/api/scans/fix", json={"sk": "nope"}).status_code == 404

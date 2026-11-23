@@ -255,11 +255,14 @@ async function loadScans() {
 
 function renderScans() {
   if (!scans.length) return $("srows").replaceChildren(el("tr", {}, el("td", { colSpan: 9, textContent: "No scans yet." })));
-  $("srows").replaceChildren(...scans.map((s) => {
+  $("srows").replaceChildren(...scans.map((s, idx) => {
     const done = s.status === "done";
+    const prev = done ? scans.slice(idx + 1).find((o) => o.repo === s.repo && o.status === "done") : null;
+    const delta = prev ? s.score - prev.score : 0;
+    const scoreCell = !done ? "" : el("span", {}, String(s.score), prev && delta ? el("small", { style: `margin-left:6px;color:${delta > 0 ? "#34d399" : "var(--hi)"}`, textContent: (delta > 0 ? "▲" : "▼") + Math.abs(delta) }) : "");
     const n = (k) => (done ? (s.issues || []).filter((i) => i.severity === k).length : "");
     const cells = [when(s), s.repo, el("span", { className: "st-" + s.status, textContent: s.status }),
-                   done ? s.score : "", n("high"), n("medium"), n("low"),
+                   scoreCell, n("high"), n("medium"), n("low"),
                    done ? `${s.files_scanned}/${s.files_total}` : "", done ? (s.cost_micro / 1e6).toFixed(4) : ""];
     const tr = el("tr", {}, ...cells.map((v, i) => el("td", { className: i >= 3 ? "num" : "" }, v)));
     tr.onclick = () => openScan(s);
@@ -267,12 +270,28 @@ function renderScans() {
   }));
 }
 
+const TYPE_LABEL = { web: "Web app / API", ai: "AI / LLM app", infra: "Infrastructure", library: "Library / CLI" };
+
+function trendSvg(repo) {  // tiny score-over-time line for one repo (done scans only), built with DOM calls, no innerHTML
+  const pts = scans.filter((x) => x.repo === repo && x.status === "done").map((x) => x.score).reverse();
+  if (pts.length < 2) return null;
+  const W = 120, H = 28, ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("width", W); svg.setAttribute("height", H); svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const line = document.createElementNS(ns, "polyline");
+  line.setAttribute("fill", "none"); line.setAttribute("stroke", "#22d3ee"); line.setAttribute("stroke-width", "2");
+  line.setAttribute("points", pts.map((v, i) => `${(i / (pts.length - 1)) * (W - 4) + 2},${H - 2 - (v / 100) * (H - 4)}`).join(" "));
+  svg.append(line);
+  return svg;
+}
+
 function openScan(s) {
   const box = $("box");
   const close = el("button", { textContent: "Close" });
   close.onclick = () => ($("modal").style.display = "none");
   box.replaceChildren(el("h3", { textContent: `${s.repo} · scan` }),
-    el("div", { className: "meta", textContent: `${when(s)} UTC · ${s.model}` + (s.branch ? ` · branch ${s.branch}` : "") }));
+    el("div", { className: "meta", textContent: `${when(s)} UTC · ${s.model}` + (s.branch ? ` · branch ${s.branch}` : "") +
+      (s.project_type ? ` · ${TYPE_LABEL[s.project_type] || s.project_type}${s.detected ? " (auto-detected)" : ""}` : "") }));
   if (s.status !== "done") {
     box.append(el("p", { className: "st-" + s.status,
                          textContent: s.status === "failed" ? "Scan failed: " + (s.error || "unknown error") : "Scan is " + s.status + "... this takes a few minutes." }),
@@ -284,23 +303,56 @@ function openScan(s) {
         el("div", {}, el("small", { textContent: "HEALTH SCORE" }), el("div", { className: "score", textContent: s.score })),
         el("div", {}, tag(count("high"), "t-hi"), " high  ", tag(count("medium"), "t-md"), " medium  ", tag(count("low"), "t-lo"), " low"),
         el("div", { className: "meta", textContent: `${s.files_scanned} of ${s.files_total} files scanned · $${(s.cost_micro / 1e6).toFixed(4)} · ${(s.duration_ms / 1000).toFixed(0)}s` })));
+    const trend = trendSvg(s.repo);
+    if (trend) box.append(el("div", { className: "meta", style: "margin-top:10px" }, "Score history (oldest to newest) ", trend));
     (s.notes || []).forEach((n) => box.append(el("p", { className: "msg", textContent: "Note: " + n })));
     (s.summaries || []).forEach((t) => box.append(el("p", { style: "color:var(--muted)", textContent: t })));
     box.append(el("h3", { textContent: "Best-practice checklist", style: "margin-top:18px" }));
     (s.checks || []).forEach((c) => box.append(el("div", { className: "chk" },
       el("span", { className: c.ok ? "ok" : "bad", textContent: c.ok ? "✓" : "✗" }),
       el("div", {}, c.name, c.ok ? "" : el("div", { className: "sug", textContent: c.hint })))));
+    if ((s.prompts || []).length) {
+      box.append(el("h3", { textContent: "Prompt review", style: "margin-top:18px" }),
+        el("p", { className: "meta", textContent: "No prompt can make injection impossible. This grades how well the prompt resists it and how clear it is." }));
+      s.prompts.forEach((p) => box.append(el("div", { className: "issue" },
+        el("div", { className: "meta" }, `${p.path}:${p.line} · score `, el("b", { textContent: `${p.score}/10` })),
+        ...(p.rubric || []).map((r) => el("div", { className: "chk" }, el("span", { className: r.ok ? "ok" : "bad", textContent: r.ok ? "✓" : "✗" }),
+          el("div", {}, r.name, r.note ? el("div", { className: "sug", textContent: r.note }) : ""))),
+        p.improved ? el("details", {}, el("summary", { textContent: "Suggested stronger prompt" }), el("pre", { textContent: p.improved })) : "")));
+    }
+    if (s.test_yaml) {
+      const copy = el("button", { textContent: "Copy" });
+      copy.onclick = () => navigator.clipboard.writeText(s.test_yaml).then(() => (copy.textContent = "Copied"));
+      box.append(el("details", { style: "margin-top:12px" }, el("summary", { textContent: "Starter prompt-injection test file (promptfoo): run it yourself in CI" }),
+        el("div", { className: "row" }, copy), el("pre", { textContent: s.test_yaml })));
+    }
     box.append(el("h3", { textContent: `Issues (${issues.length})`, style: "margin-top:18px" }));
     if (!issues.length) box.append(el("p", { textContent: "No issues found." }));
     issues.forEach((i) => {
-      const href = `https://github.com/${s.repo}/blob/${encodeURIComponent(s.branch || "HEAD")}/${i.path.split("/").map(encodeURIComponent).join("/")}#L${i.line}`;
+      const href = i.commit ? `https://github.com/${s.repo}/commit/${encodeURIComponent(i.commit)}`
+        : `https://github.com/${s.repo}/blob/${encodeURIComponent(s.branch || "HEAD")}/${i.path.split("/").map(encodeURIComponent).join("/")}#L${i.line}`;
       box.append(el("div", { className: "issue" },
-        el("div", { className: "meta" }, tag(i.severity, SEV_CLASS[i.severity]), ` ${i.category} · `,
-           el("a", { href, target: "_blank", rel: "noopener", textContent: `${i.path}:${i.line}` })),
+        el("div", { className: "meta" }, tag(i.severity, SEV_CLASS[i.severity]), ` ${i.category}${i.owasp ? " · " + i.owasp : ""} · `,
+           el("a", { href, target: "_blank", rel: "noopener", textContent: i.commit ? `${i.path} (git history)` : `${i.path}:${i.line}` })),
         el("p", { textContent: i.message }),
         i.suggestion ? el("div", { className: "sug", textContent: "Fix: " + i.suggestion }) : ""));
     });
-    box.append(el("div", { className: "row", style: "margin-top:14px" }, close));
+    const fixable = (s.checks || []).some((c) => !c.ok && ["Security policy", ".gitignore", "Dependency update bot"].includes(c.name));
+    const fixmsg = el("span", { className: "msg" });
+    const row = el("div", { className: "row", style: "margin-top:14px" }, close);
+    if (fixable) {
+      const fix = el("button", { className: "go", textContent: "Open fix PR (SECURITY.md, Dependabot, .gitignore)" });
+      fix.onclick = async () => {
+        if (!confirm(`Open a pull request on ${s.repo} that adds the missing basic files? Nothing is merged.`)) return;
+        fix.disabled = true; fixmsg.textContent = "Opening...";
+        try {
+          const r = await api("POST", "/api/scans/fix", { sk: s.sk });
+          fixmsg.replaceChildren("Opened: ", el("a", { href: r.url, target: "_blank", rel: "noopener", textContent: r.url }));
+        } catch (e) { fixmsg.textContent = e.message; fix.disabled = false; }
+      };
+      row.append(fix);
+    }
+    box.append(row, fixmsg);
   }
   $("modal").style.display = "flex";
 }
@@ -309,7 +361,7 @@ $("startscan").onclick = async () => {
   $("smsg").style.color = "";
   if (!$("srepo").value) { $("smsg").textContent = "Choose a connected repo first."; return; }
   try {
-    await api("POST", "/api/scans", { repo: $("srepo").value, model: $("smodel").value, max_cost_usd: +$("scap").value });
+    await api("POST", "/api/scans", { repo: $("srepo").value, model: $("smodel").value, max_cost_usd: +$("scap").value, project_type: $("sptype").value });
     $("smsg").textContent = "Scan queued. It usually takes 1-5 minutes."; $("smsg").style.color = "#34d399";
     await loadScans();
   } catch (e) { $("smsg").textContent = e.message; }

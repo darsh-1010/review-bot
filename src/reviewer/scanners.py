@@ -4,6 +4,8 @@ import os
 import re
 import tempfile
 
+import checks
+
 # (name, pattern). Matched values are never copied into findings, only the rule name.
 SECRET_PATTERNS = [
     ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
@@ -63,14 +65,14 @@ def scan_bandit(files: dict[str, str]):
                  "rule": i.test_id, "message": i.text} for i in mgr.get_issue_list() if i.fname in names]
 
 
-def scan(files: dict[str, str]):
-    """Both scanners; each one failing only loses its own findings."""
+def scan(files: dict[str, str], packs=None):
+    """All scanners; each one failing only loses its own findings. packs=None runs every rule pack."""
     out = []
-    for fn in (scan_secrets, scan_bandit):
+    for fn in (scan_secrets, scan_bandit, lambda f: checks.run_rules(f, packs)):
         try:
             out += fn(files)
         except Exception as e:  # ponytail: log and move on, a scanner bug must not block a review
-            print(f"{fn.__name__} failed:", repr(e))
+            print("scanner failed:", repr(e))
     return out
 
 

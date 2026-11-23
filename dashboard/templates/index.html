@@ -63,6 +63,8 @@
   .tabs button.on { background:linear-gradient(120deg,var(--a),var(--b)); border:0; }
   .score { font-size:44px; font-weight:800; line-height:1; }
   .chk { display:flex; gap:10px; padding:6px 0; } .chk .ok { color:#34d399; } .chk .bad { color:var(--hi); }
+  pre { white-space:pre-wrap; word-break:break-word; background:#0d1020; padding:10px; border-radius:8px; font-size:12px; max-height:260px; overflow:auto; }
+  details summary { cursor:pointer; color:var(--b); margin:6px 0; }
   .sug { color:var(--b); font-size:14px; }
   .st-failed { color:var(--hi); } .st-done { color:#34d399; } .st-running,.st-queued { color:var(--md); }
   .thumb.on { background:rgba(52,211,153,.35); } .thumb.down.on { background:rgba(255,77,109,.35); }
@@ -131,6 +133,9 @@
         and a list of issues with a suggested fix for each. Pick a repo you have already connected.</p>
       <div class="row">
         <select id="srepo" class="grow"><option value="">Connect a repo first</option></select>
+        <select id="sptype" title="What kind of project is this? Picks which checks run.">
+          <option value="auto">Project type: auto-detect</option><option value="web">Web app / API</option>
+          <option value="ai">AI / LLM app</option><option value="infra">Infrastructure / DevOps</option><option value="library">Library / CLI</option></select>
         <select id="smodel"><option value="claude-haiku-5-5">Haiku (cheaper)</option><option value="claude-sonnet-5-5">Sonnet (deeper)</option></select>
         <label>max $ / scan <input id="scap" type="number" min="0.05" max="10" step="0.25" value="1.00"></label>
         <button id="startscan" class="go">Start scan</button>

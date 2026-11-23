@@ -5,6 +5,8 @@ import json
 import posixpath
 import time
 
+import checks
+import deps
 import app  # reuses the reviewer's table, SSM token lookup, repo settings and Claude client
 import claude_client as cc
 import diff_utils as du
@@ -28,6 +30,8 @@ def priority(path: str):
     """Lower = scanned first. None = not worth sending to Claude."""
     low, name = path.lower(), posixpath.basename(path).lower()
     ext = posixpath.splitext(name)[1]
+    if name in LOCKFILES:
+        return None
     if name in du.SKIP_NAMES or low.endswith(du.SKIP_SUFFIX) or du.SKIP_DIRS & set(low.split("/")[:-1]):
         return None
     if (name == "dockerfile" or name.startswith(".env") or ext == ".tf" or low.startswith(".github/workflows/")
@@ -82,6 +86,11 @@ def checklist(paths: list[str], texts: dict[str, str]):
     return [{"name": n, "ok": bool(ok), "hint": h} for n, ok, h in items]
 
 
+def near(issues, f):
+    """Did Claude already report this finding (same file, within 2 lines)?"""
+    return any(i["path"] == f["path"] and abs(i["line"] - f["line"]) <= 2 for i in issues)
+
+
 def score(issues: list[dict], checks: list[dict]):
     """0-100 at a glance. Deliberately simple: -12 per high, -4 per medium, -1 per low, -3 per failed check."""
     n = lambda s: sum(i["severity"] == s for i in issues)  # noqa: E731
@@ -112,6 +121,7 @@ def run(job, context):
         return
     _set(sk, status="running")
     t0 = time.time()
+    left = context.get_remaining_time_in_millis
     model = job["model"] if job["model"] in cc.PRICES else app.MODEL
     cap = int(job["max_cost_micro"])
     _, _, account = app.repo_settings(repo)
@@ -124,14 +134,29 @@ def run(job, context):
 
     texts, notes = {}, []
     for p in paths:
-        if context.get_remaining_time_in_millis() < 240_000:  # leave time for Claude and the save
+        if left() < 240_000:  # leave time for Claude and the save
             notes.append("ran out of time while downloading files")
             break
         text = gh.get_file(repo, p, branch, token, MAX_FILE_BYTES)
         if text is not None:
             texts[p] = text
 
-    found = scanners.scan(texts)
+    manifests = {}  # dependency files, checked against OSV.dev (never sent to Claude)
+    for t in [t for t in tree if posixpath.basename(t["path"]) in deps.MANIFEST_NAMES and priority_dir_ok(t["path"])][:10]:
+        if left() > 300_000 and t["size"] <= 1_500_000:
+            text = gh.get_file(repo, t["path"], branch, token, 1_500_000)
+            if text:
+                manifests[t["path"]] = text
+
+    ptype = job.get("project_type", "auto")
+    detected = ptype not in checks.PROJECT_TYPES or ptype == "auto"
+    if detected:
+        ptype = checks.detect_type({**texts, **manifests})
+    packs = checks.PACKS.get(ptype, set()) | {"generic"}
+
+    found = scanners.scan(texts, packs)
+    prompts = checks.extract_prompts(texts) if ptype == "ai" else []
+    found += checks.prompt_secret_findings(prompts)
     secrets = [f for f in found if f["tool"] == "secrets"]
     by_file = {}
     for f in found:
@@ -148,24 +173,61 @@ def run(job, context):
 
     summaries, issues, tin, tout = [], [], 0, 0
     for c in du.chunk(sections, 30_000):
-        if context.get_remaining_time_in_millis() < 100_000:
+        if left() < 100_000:
             notes.append("ran out of time: part of the files was not analysed")
             break
         if cc.cost_micro(model, tin, tout) + cc.estimate_micro(model, c) > cap:
             notes.append(f"cost cap ${cap / 1e6:.2f} reached: part of the files was not analysed")
             break
-        out, usage = cc.scan_chunk(app._claude(), model, c)
+        out, usage = cc.scan_chunk(app._claude(), model, c, ptype)
         summaries.append(out["summary"])
         issues += out["issues"]
         tin, tout = tin + usage.input_tokens, tout + usage.output_tokens
 
-    for f in secrets:  # a leaked key is always reported
-        if not any(i["path"] == f["path"] and i["line"] == f["line"] for i in issues):
-            issues.append({"path": f["path"], "line": f["line"], "severity": "high", "category": "security",
-                           "message": f["message"], "suggestion": "Revoke the key, then load it from a secret store such as SSM or Secrets Manager."})
+    review, test_yaml = [], ""
+    if prompts and left() > 90_000:  # grade the system prompt(s) and draft a starter test file
+        body = "\n".join(p["text"] for p in prompts)
+        if cc.cost_micro(model, tin, tout) + cc.cost_micro(model, len(body) // 4 + 2000, 8000) > cap:
+            notes.append("cost cap reached: prompt review skipped")
+        else:
+            try:
+                out, usage = cc.prompt_review(app._claude(), model, prompts)
+                review, test_yaml = out["prompts"], out["test_yaml"][:8000]
+                tin, tout = tin + usage.input_tokens, tout + usage.output_tokens
+            except Exception as e:  # noqa: BLE001 - the rest of the scan is still worth saving
+                print("prompt review failed:", repr(e))
+                notes.append("prompt review failed; the rest of the scan is complete")
+
+    direct = list(secrets) + [f for f in found if f["tool"] == "rules" and f["severity"] == "high"]
+    if manifests:
+        osv, note = deps.audit(manifests)
+        direct += osv
+        notes += [note] if note and (osv or "skipped" in note) else []
+    if left() > 120_000:  # secrets removed from the code but still in git history
+        try:
+            known = {(f["path"], f["rule"]) for f in secrets}
+            for sha, added in gh.get_commit_patches(repo, token, 25):
+                for f in scanners.scan_secrets(added):
+                    if (f["path"], f["rule"]) not in known:
+                        known.add((f["path"], f["rule"]))
+                        direct.append({**f, "line": 1, "commit": sha,
+                                       "message": f"{f['rule']} found in git history (commit {sha[:7]}). Even if deleted since, it is still readable."})
+        except Exception as e:  # noqa: BLE001
+            print("history scan failed:", repr(e))
+            notes.append("git history scan skipped")
+    claude, injected = list(issues), set()
+    for f in direct:  # deterministic findings are always reported, even if Claude missed them or the cap stopped it
+        if not near(claude, f) and (f["path"], f["line"]) not in injected:
+            injected.add((f["path"], f["line"]))
+            issues.append({"path": f["path"], "line": f["line"], "severity": f["severity"],
+                           "category": f.get("category", "security"), "message": f["message"],
+                           "suggestion": f.get("suggestion", "Revoke the key, then load it from a secret store such as SSM or Secrets Manager."),
+                           **({"owasp": f["owasp"]} if f.get("owasp") else {}), **({"commit": f["commit"]} if f.get("commit") else {})})
     issues.sort(key=lambda i: SEV[i["severity"]])
     issues = issues[:MAX_ISSUES]
-    checks = checklist([t["path"] for t in tree], texts)
+    checks_list = checklist([t["path"] for t in tree], texts)
+    if ptype == "ai":
+        checks_list += [{"name": n, "ok": bool(ok), "hint": h} for n, ok, h in checks.ai_checklist(found, texts)]
     if truncated:
         notes.append("GitHub returned a partial file list (very large repo)")
     too_big = sum(t["size"] > MAX_FILE_BYTES and priority(t["path"]) is not None for t in tree)
@@ -176,8 +238,14 @@ def run(job, context):
     if left_out:
         notes.append(f"{left_out} lower-priority files were not scanned (limits: {MAX_FILES} files, {MAX_BYTES // 1000} KB)")
 
-    _set(sk, status="done", branch=branch, model=model, summaries=summaries[:8], issues=issues, checks=checks,
-         score=score(issues, checks), files_scanned=len(texts), files_total=len(tree), notes=notes,
+    _set(sk, status="done", branch=branch, model=model, summaries=summaries[:8], issues=issues, checks=checks_list,
+         score=score(issues, checks_list), files_scanned=len(texts), files_total=len(tree), notes=notes,
+         project_type=ptype, detected=detected, prompts=review, test_yaml=test_yaml,
          bandit_findings=sum(f["tool"] == "bandit" for f in found), input_tokens=tin, output_tokens=tout,
          cost_micro=cc.cost_micro(model, tin, tout), duration_ms=int((time.time() - t0) * 1000),
          finished=datetime.datetime.now(datetime.timezone.utc).isoformat())
+
+
+def priority_dir_ok(path):
+    """Skip vendored copies (node_modules, venv...) when looking for dependency manifests."""
+    return not (du.SKIP_DIRS & set(path.lower().split("/")[:-1]))

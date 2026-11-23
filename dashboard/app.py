@@ -1,4 +1,4 @@
-import datetime, functools, hmac, json, os, re, time, urllib.error, urllib.request
+import base64, datetime, functools, hmac, json, os, re, time, urllib.error, urllib.request
 import boto3
 from boto3.dynamodb.conditions import Key
 from flask import Flask, Response, abort, render_template, request
@@ -9,6 +9,7 @@ ssm = boto3.client("ssm")
 sqs = boto3.client("sqs")
 SCAN_STALE_S = 30 * 60  # a scan Lambda lives 15 min; anything "running" longer than 30 died
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5")
+PROJECT_TYPES = ("auto", "web", "ai", "infra", "library")
 REPO_RE = re.compile(r"^(?:https?://github\.com/)?([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 
 
@@ -256,7 +257,7 @@ def remove_repo():
 
 # ---------- repo scans: the Scan Lambda does the work; this only queues a job and shows the saved result ----------
 def _scan_rows():
-    items = table.query(KeyConditionExpression=Key("pk").eq("SCAN"), ScanIndexForward=False, Limit=15)["Items"]
+    items = table.query(KeyConditionExpression=Key("pk").eq("SCAN"), ScanIndexForward=False, Limit=60)["Items"]
     now = datetime.datetime.now(datetime.timezone.utc)
     for i in items:
         age = (now - datetime.datetime.fromisoformat(i["sk"].split("#")[0])).total_seconds()
@@ -284,12 +285,79 @@ def start_scan():
     for i in _scan_rows():  # one scan per repo at a time: every scan costs money
         if i["repo"] == repo and i["status"] in ("queued", "running"):
             return _err("a scan of this repo is already running", 409)
+    ptype = d.get("project_type", "auto")
+    if ptype not in PROJECT_TYPES:
+        return _err("project_type must be one of " + ", ".join(PROJECT_TYPES))
     sk = f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}#{repo}"
     table.put_item(Item={"pk": "SCAN", "sk": sk, "repo": repo, "status": "queued", "model": s["model"],
-                         "expires_at": int(time.time()) + 90 * 86400})
+                         "project_type": ptype, "expires_at": int(time.time()) + 90 * 86400})
     q = sqs.get_queue_url(QueueName=os.environ.get("SCAN_QUEUE_NAME", "reviewbot-scan-jobs"))["QueueUrl"]
-    sqs.send_message(QueueUrl=q, MessageBody=json.dumps({"sk": sk, "repo": repo, **s}))
+    sqs.send_message(QueueUrl=q, MessageBody=json.dumps({"sk": sk, "repo": repo, "project_type": ptype, **s}))
     return _json({"sk": sk, "status": "queued"}, 202)
+
+
+# ---------- "Open fix PR": adds the missing basics (SECURITY.md, Dependabot, .gitignore) on a new branch. Only on a click. ----------
+SECURITY_MD = """# Security policy
+
+## Reporting a vulnerability
+Please do not open a public issue. Report it privately through this repository's
+**Security > Report a vulnerability** page, or email the maintainers. We aim to reply within 5 working days.
+
+## Supported versions
+Only the latest release on the default branch receives security fixes.
+"""
+GITIGNORE = {"python": "__pycache__/\n*.pyc\n.venv/\nvenv/\n.env\n", "node": "node_modules/\n.env\ndist/\n",
+             "any": ".env\n.env.*\n!.env.example\n.DS_Store\n*.pem\n*.key\n"}
+DEPENDABOT = {"pip": "requirements.txt", "npm": "package.json", "github-actions": ".github/workflows/", "docker": "Dockerfile",
+              "terraform": ".tf"}
+
+
+def _fix_files(paths, checks):
+    """Which files to add, judged from the failed checklist items and what the repo already contains."""
+    failed = {c["name"] for c in checks if not c.get("ok")}
+    names = {p.rsplit("/", 1)[-1] for p in paths}
+    out = {}
+    if "Security policy" in failed:
+        out["SECURITY.md"] = SECURITY_MD
+    if ".gitignore" in failed:
+        out[".gitignore"] = GITIGNORE["any"] + (GITIGNORE["python"] if names & {"requirements.txt", "pyproject.toml"} or any(p.endswith(".py") for p in paths) else "") \
+            + (GITIGNORE["node"] if "package.json" in names else "")
+    if "Dependency update bot" in failed:
+        eco = [e for e, m in DEPENDABOT.items() if any(m in p or p.endswith(m) or p.startswith(m) for p in paths)]
+        if eco:
+            out[".github/dependabot.yml"] = "version: 2\nupdates:\n" + "".join(
+                f'  - package-ecosystem: "{e}"\n    directory: "/"\n    schedule:\n      interval: "weekly"\n' for e in eco)
+    return out
+
+
+@app.post("/api/scans/fix")
+def fix_pr():
+    sk = (request.get_json(silent=True) or {}).get("sk", "")
+    row = table.get_item(Key={"pk": "SCAN", "sk": sk}).get("Item") if isinstance(sk, str) and sk else None
+    if not row or row.get("status") != "done":
+        return _err("no finished scan with that id", 404)
+    repo = row["repo"]
+    acct = table.get_item(Key={"pk": "REPOS", "sk": repo}).get("Item", {}).get("account")
+    try:
+        tree = _gh("GET", f"/repos/{repo}/git/trees/{row['branch']}?recursive=1", account=acct)["tree"]
+        files = _fix_files([t["path"] for t in tree if t["type"] == "blob"], row.get("checks", []))
+        if not files:
+            return _err("nothing to add: the missing items need a human decision (README, license, tests, CI)", 409)
+        base = _gh("GET", f"/repos/{repo}/git/ref/heads/{row['branch']}", account=acct)["object"]["sha"]
+        branch = "reviewbot/security-basics-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        _gh("POST", f"/repos/{repo}/git/refs", {"ref": "refs/heads/" + branch, "sha": base}, account=acct)
+        for path, text in files.items():
+            _gh("PUT", f"/repos/{repo}/contents/{path}", {"message": f"Add {path}", "branch": branch,
+                "content": base64.b64encode(text.encode()).decode()}, account=acct)
+        pr = _gh("POST", f"/repos/{repo}/pulls", {"title": "Add security basics (ReviewBot)", "head": branch, "base": row["branch"],
+            "body": "Added by ReviewBot after a repo scan: " + ", ".join(files) + ". Review before merging."}, account=acct)
+    except urllib.error.HTTPError as e:
+        try:
+            why = json.loads(e.read()).get("message", "")
+        except Exception:
+            why = ""
+        return _err(f"GitHub answered {e.code}: {why or 'no details'}. The token needs Contents: write and Pull requests: write on this repo.", 502)
+    return _json({"url": pr["html_url"], "files": list(files)}, 201)
 
 
 @app.get("/health")
