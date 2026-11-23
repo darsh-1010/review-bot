@@ -275,9 +275,9 @@ def scans():
 def start_scan():
     d = request.get_json(silent=True) or {}
     repo = d.get("repo")
-    item = table.get_item(Key={"pk": "REPOS", "sk": repo}).get("Item") if isinstance(repo, str) else None
+    item = table.get_item(Key={"pk": "REPOS", "sk": repo}).get("Item") if isinstance(repo, str) and repo else None
     if not item:
-        return _err("connect the repo first", 404)
+        return _err("choose a connected repo first" if not repo else "connect the repo first", 400 if not repo else 404)
     s = _settings({"model": d.get("model", item.get("model", MODELS[0])), "max_cost_usd": d.get("max_cost_usd", 1.0)})
     if isinstance(s, str):
         return _err(s)

@@ -307,6 +307,7 @@ function openScan(s) {
 
 $("startscan").onclick = async () => {
   $("smsg").style.color = "";
+  if (!$("srepo").value) { $("smsg").textContent = "Choose a connected repo first."; return; }
   try {
     await api("POST", "/api/scans", { repo: $("srepo").value, model: $("smodel").value, max_cost_usd: +$("scap").value });
     $("smsg").textContent = "Scan queued. It usually takes 1-5 minutes."; $("smsg").style.color = "#34d399";

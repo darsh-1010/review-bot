@@ -29,12 +29,13 @@ jobs:
           out() { aws cloudformation describe-stacks --stack-name reviewbot --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
           INSTANCE=$(out DashboardInstanceId)
           DNS=$(aws ec2 describe-instances --instance-ids "$INSTANCE" --query "Reservations[0].Instances[0].PublicDnsName" --output text)
+          AMI=$(aws ec2 describe-instances --instance-ids "$INSTANCE" --query "Reservations[0].Instances[0].ImageId" --output text)  # keep the running AMI so a new Amazon Linux release does not replace the server
           SECRET=$(aws ssm get-parameter --name /reviewbot/origin-secret --with-decryption --query Parameter.Value --output text)
           echo "::add-mask::$SECRET"
           sam build
           sam deploy --no-confirm-changeset --no-fail-on-empty-changeset --parameter-overrides \
             ClaudeModel=${{ vars.CLAUDE_MODEL }} CloudFrontPrefixList=${{ vars.CF_PREFIX_LIST }} \
-            OriginSecret="$SECRET" DashboardOrigin="$DNS" \
+            OriginSecret="$SECRET" DashboardOrigin="$DNS" DashboardAmi="$AMI" \
             ${WEB_ACL_ARN:+WebAclArn=$WEB_ACL_ARN} ${ALERT_EMAIL:+AlertEmail=$ALERT_EMAIL} ${ALERT_EMAIL2:+AlertEmail2=$ALERT_EMAIL2}
       - name: Deploy dashboard to EC2
         run: |
