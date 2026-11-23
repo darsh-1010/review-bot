@@ -92,9 +92,12 @@ def near(issues, f):
 
 
 def score(issues: list[dict], checks: list[dict]):
-    """0-100 at a glance. Deliberately simple: -12 per high, -4 per medium, -1 per low, -3 per failed check."""
+    """0-100 at a glance. Each group is capped so one noisy category cannot zero the score:
+    -12 per high (max 50), -4 per medium (max 25), -1 per low (max 10), -3 per failed check (max 15)."""
     n = lambda s: sum(i["severity"] == s for i in issues)  # noqa: E731
-    return max(0, 100 - 12 * n("high") - 4 * n("medium") - n("low") - 3 * sum(not c["ok"] for c in checks))
+    lost = (min(50, 12 * n("high")) + min(25, 4 * n("medium")) + min(10, n("low"))
+            + min(15, 3 * sum(not c["ok"] for c in checks)))
+    return max(0, 100 - lost)
 
 
 def _set(sk, **fields):

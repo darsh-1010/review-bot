@@ -17,6 +17,7 @@ SECRET_PATTERNS = [
         r"""(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)\b["']?\s*[:=]\s*["']([^"'\s]{8,})["']""")),
 ]
 PLACEHOLDER = re.compile(r"(?i)example|your[_-]|changeme|placeholder|dummy|sample|xxxx|<.+>|\$\{|\{\{|test|todo|redacted|\*{4}")
+TEST_PATH = re.compile(r"(?i)(^|/)(tests?|__tests__|spec|fixtures?)/|(^|/)test_[^/]*$|_test\.\w+$|\.(test|spec)\.\w+$")
 SKIP_SECRET_SUFFIX = (".md", ".lock", ".svg", ".png", ".jpg", ".pdf", ".map")
 
 
@@ -35,9 +36,11 @@ def scan_secrets(files: dict[str, str]):
                     continue
                 if name == "Hardcoded credential" and PLACEHOLDER.search(m.group(1)):
                     continue
-                out.append({"path": path, "line": n, "severity": "high", "tool": "secrets", "rule": name,
+                test = bool(TEST_PATH.search(path))  # fixtures are usually fake keys: keep the finding, but low
+                out.append({"path": path, "line": n, "severity": "low" if test else "high", "tool": "secrets", "rule": name,
                             "message": f"Possible {name} committed in source. Rotate it, remove it from the code "
-                                       f"and from git history, and load it from a secret store instead."})
+                                       f"and from git history, and load it from a secret store instead."
+                                       + (" (In a test file: ignore if it is a fake value.)" if test else "")})
                 break  # one finding per line
     return out
 

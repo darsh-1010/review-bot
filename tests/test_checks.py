@@ -63,3 +63,11 @@ def test_dependency_parsing_only_trusts_pinned_versions():
                       "package-lock.json": '{"packages": {"": {}, "node_modules/a": {"version": "1.2.3"}}}'})
     names = {(e, n, v) for e, n, v, _ in got}
     assert names == {("PyPI", "flask", "2.0.1"), ("PyPI", "numpy", "1.0"), ("npm", "left-pad", "1.3.0"), ("npm", "a", "1.2.3")}
+
+
+def test_secret_in_test_file_is_low_and_score_is_capped():
+    import scanners, scan
+    key = "AKIA" + "A" * 16
+    f = scanners.scan_secrets({"tests/test_x.py": f'K="{key}"\n', "app.py": f'K="{key}"\n'})
+    assert {x["path"]: x["severity"] for x in f} == {"tests/test_x.py": "low", "app.py": "high"}
+    assert scan.score([{"severity": "high"}] * 20, []) == 50
