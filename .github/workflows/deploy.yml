@@ -8,25 +8,36 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      HAS_AWS: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with: { python-version: '3.13' }
       - run: pip install anthropic boto3 flask pytest 'moto[dynamodb,ssm,s3,sqs]' bandit && pytest -q
+      - name: Skip deploy (no AWS credentials in this repo)
+        if: env.HAS_AWS != 'true'
+        run: echo "::notice::Tests passed. Deploy skipped, add repo secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to enable it."
       - uses: aws-actions/setup-sam@v3
+        if: env.HAS_AWS == 'true'
         with: { use-installer: true, token: '${{ secrets.GITHUB_TOKEN }}' }
       - uses: aws-actions/configure-aws-credentials@v6
+        if: env.HAS_AWS == 'true'
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-southeast-2
       - name: Deploy infrastructure and Lambdas
+        if: env.HAS_AWS == 'true'
         env:
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          CF_PREFIX_LIST: ${{ vars.CF_PREFIX_LIST }}
           WEB_ACL_ARN: ${{ vars.WEB_ACL_ARN }}   # optional repo variables: output of scripts/create-waf.sh, alert email
           ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
           ALERT_EMAIL2: ${{ vars.ALERT_EMAIL2 }}
         run: |
           out() { aws cloudformation describe-stacks --stack-name reviewbot --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          par() { aws cloudformation describe-stacks --stack-name reviewbot --query "Stacks[0].Parameters[?ParameterKey=='$1'].ParameterValue | [0]" --output text; }
           INSTANCE=$(out DashboardInstanceId)
           DNS=$(aws ec2 describe-instances --instance-ids "$INSTANCE" --query "Reservations[0].Instances[0].PublicDnsName" --output text)
           AMI=$(aws ec2 describe-instances --instance-ids "$INSTANCE" --query "Reservations[0].Instances[0].ImageId" --output text)  # keep the running AMI so a new Amazon Linux release does not replace the server
@@ -34,10 +45,11 @@ jobs:
           echo "::add-mask::$SECRET"
           sam build
           sam deploy --no-confirm-changeset --no-fail-on-empty-changeset --parameter-overrides \
-            ClaudeModel=${{ vars.CLAUDE_MODEL }} CloudFrontPrefixList=${{ vars.CF_PREFIX_LIST }} \
+            ClaudeModel="${CLAUDE_MODEL:-$(par ClaudeModel)}" CloudFrontPrefixList="${CF_PREFIX_LIST:-$(par CloudFrontPrefixList)}" \
             OriginSecret="$SECRET" DashboardOrigin="$DNS" DashboardAmi="$AMI" \
             ${WEB_ACL_ARN:+WebAclArn=$WEB_ACL_ARN} ${ALERT_EMAIL:+AlertEmail=$ALERT_EMAIL} ${ALERT_EMAIL2:+AlertEmail2=$ALERT_EMAIL2}
       - name: Deploy dashboard to EC2
+        if: env.HAS_AWS == 'true'
         run: |
           out() { aws cloudformation describe-stacks --stack-name reviewbot --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
           BUCKET=$(out ReleaseBucketName); INSTANCE=$(out DashboardInstanceId); TABLE=$(out ReviewsTableName); HOOK=$(out WebhookUrl)
@@ -49,6 +61,7 @@ jobs:
             --query Command.CommandId --output text)
           aws ssm wait command-executed --command-id "$CMD" --instance-id "$INSTANCE"
       - name: Smoke test
+        if: env.HAS_AWS == 'true'
         run: |
           URL=$(aws cloudformation describe-stacks --stack-name reviewbot --query "Stacks[0].Outputs[?OutputKey=='DashboardUrl'].OutputValue" --output text)
           curl -fsS "$URL/health"
